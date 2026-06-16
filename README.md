@@ -4,6 +4,8 @@
 [![Target Framework](https://img.shields.io/badge/.NET-10.0-blue.svg)](#)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zero-Allocation](https://img.shields.io/badge/Allocations-Zero%20Heap-orange.svg)](#)
+[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Chrono.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Chrono/)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Chrono.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Chrono/)
 
 Glacier.Chrono is an embedded, in-process time-series database engine designed for extreme write-throughput and zero-allocation query execution in **.NET 10**. 
 
