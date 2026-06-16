@@ -1,0 +1,32 @@
+## Build outputs
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+
+## IDE and user settings
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+*.iws
+
+## BenchmarkDotNet
+BenchmarkDotNet.Artifacts/
+
+## Operating System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+## Log files
+*.log
+
+## Temporary storage
+temp/
+tmp/
+glacier_data/
+benchmark_data/

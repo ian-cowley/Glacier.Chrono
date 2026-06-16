@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/Glacier.Chrono/Glacier.Chrono.csproj" />
+  <Project Path="samples/Glacier.Chrono.Demo/Glacier.Chrono.Demo.csproj" />
+  <Project Path="samples/Glacier.Chrono.Benchmarks/Glacier.Chrono.Benchmarks.csproj" />
+</Solution>
