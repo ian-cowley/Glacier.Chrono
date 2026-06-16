@@ -1,22 +1,44 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Chrono.Compression;
 using Glacier.Chrono.Storage;
-using Glacier.Chrono.Query;
 
 namespace Glacier.Chrono.Demo;
+
+[ChronoTable]
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public struct SystemMetric : IComparable<SystemMetric>
+{
+    [Timestamp]
+    public long Time;
+
+    [Metric]
+    public float CpuTemp;
+
+    [Metric]
+    public float FanSpeed;
+
+    [Category]
+    public int ServerId;
+
+    public int CompareTo(SystemMetric other)
+    {
+        return Time.CompareTo(other.Time);
+    }
+}
 
 class Program
 {
     static void Main(string[] args)
     {
-        Console.WriteLine("=== Glacier.Chrono Complete Engine Verification Demo ===");
+        Console.WriteLine("=== Glacier.Chrono Source Generator & Custom Method Demo ===");
 
         int capacity = 16384;
-        var ringBuffer = new HotRingBuffer<TelemetryRow>(capacity);
+        var ringBuffer = new HotRingBuffer<SystemMetric>(capacity);
         
         int totalItems = 10000;
         int writerThreadsCount = 4;
@@ -30,20 +52,19 @@ class Program
         long startBytes = GC.GetAllocatedBytesForCurrentThread();
 
         // 1. Concurrent Lock-Free Ingest
-        Console.WriteLine($"\n[1/5] Ingesting {totalItems} rows concurrently across {writerThreadsCount} threads...");
+        Console.WriteLine($"\n[1/5] Ingesting {totalItems} custom SystemMetric rows concurrently across {writerThreadsCount} threads...");
         var stopwatch = Stopwatch.StartNew();
 
         Parallel.For(0, writerThreadsCount, threadId =>
         {
             for (int i = 0; i < itemsPerThread; i++)
             {
-                var row = new TelemetryRow
+                var row = new SystemMetric
                 {
-                    // Generate regular 1-second intervals for DoD timestamp compression testing
-                    Timestamp = DateTime.UtcNow.Date.Ticks + (i * TimeSpan.TicksPerSecond),
-                    CpuUsage = 45.0f + (float)Math.Sin(i * 0.05) * 5.0f,
-                    MemUsage = 80.0f + (float)Math.Cos(i * 0.02) * 2.0f,
-                    EntityId = threadId // Low cardinality for RLE compression testing (values 0, 1, 2, 3)
+                    Time = DateTime.UtcNow.Date.Ticks + (i * TimeSpan.TicksPerSecond),
+                    CpuTemp = 50.0f + (float)Math.Sin(i * 0.05) * 10.0f,
+                    FanSpeed = 2000.0f + (float)Math.Cos(i * 0.02) * 500.0f,
+                    ServerId = threadId // Server IDs 0, 1, 2, 3
                 };
                 ringBuffer.Write(in row);
             }
@@ -55,27 +76,29 @@ class Program
 
         Console.WriteLine($"Ingest completed in {stopwatch.Elapsed.TotalMilliseconds:F2} ms");
 
-        // 2. Pivot & Compaction (AoS to SoA, DoD, Gorilla, RLE, and File write)
-        Console.WriteLine("\n[2/5] Compacting and flushing to disk...");
+        // 2. Pivot & Compaction via Generator-emitted Compactor
+        Console.WriteLine("\n[2/5] Compacting custom schema and flushing to disk via generated compactor...");
         string outputDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "glacier_data");
         if (Directory.Exists(outputDir))
         {
             Directory.Delete(outputDir, true);
         }
 
-        var compBuffers = new CompactorBuffers(totalItems);
+        // Use the compile-time generated buffers class
+        var compBuffers = new SystemMetricCompactorBuffers(totalItems);
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
         long startCompactBytes = GC.GetAllocatedBytesForCurrentThread();
 
         long nextSeq = 0;
-        bool compactSuccess = Compactor.CompactBatch(ringBuffer, ref nextSeq, totalItems, outputDir, compBuffers);
+        // Call the compile-time generated compactor
+        bool compactSuccess = SystemMetricCompactor.CompactBatch(ringBuffer, ref nextSeq, totalItems, outputDir, compBuffers);
 
         long endCompactBytes = GC.GetAllocatedBytesForCurrentThread();
         long compactAllocated = endCompactBytes - startCompactBytes;
 
-        Console.WriteLine($"Compactor Result: {(compactSuccess ? "SUCCESS" : "FAILED")}");
+        Console.WriteLine($"Generated Compactor Result: {(compactSuccess ? "SUCCESS" : "FAILED")}");
         Console.WriteLine($"Compaction & Disk Writing Heap Allocations: {compactAllocated} bytes (Goal: < 8000 bytes for FileStream wrapper)");
 
         // 3. Print File Info
@@ -85,7 +108,7 @@ class Program
             var fileInfo = new FileInfo(chunkFile);
             Console.WriteLine($"Generated chunk file: {fileInfo.FullName}");
             Console.WriteLine($"Chunk file size: {fileInfo.Length} bytes");
-            Console.WriteLine($"Uncompressed size would be: {totalItems * 20} bytes (Compression ratio: {((double)fileInfo.Length / (totalItems * 20)) * 100:F2}%)");
+            Console.WriteLine($"Uncompressed size would be: {totalItems * Marshal.SizeOf<SystemMetric>()} bytes (Compression ratio: {((double)fileInfo.Length / (totalItems * Marshal.SizeOf<SystemMetric>())) * 100:F2}%)");
         }
         else
         {
@@ -93,21 +116,24 @@ class Program
             return;
         }
 
-        // 4. SIMD Vectorized Queries
-        Console.WriteLine("\n[3/5] Executing SIMD query on memory-mapped columns...");
-        var queryBuffers = new QueryBuffers(totalItems);
+        // 4. SIMD Vectorized Queries via Generator-emitted QueryEngine
+        Console.WriteLine("\n[3/5] Executing custom SIMD query on memory-mapped columns...");
+        
+        // Use the compile-time generated query buffers
+        var queryBuffers = new SystemMetricQueryBuffers(totalItems);
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
         long startQueryBytes = GC.GetAllocatedBytesForCurrentThread();
 
-        int targetEntityId = 1;
-        double averageCpu = QueryEngine.GetAverageCpuUsageForEntity(chunkFile, targetEntityId, queryBuffers);
+        int targetServerId = 2;
+        // Call the custom generated SIMD aggregation method: GetAverageCpuTempForServerId
+        double averageCpuTemp = SystemMetricQueryEngine.GetAverageCpuTempForServerId(chunkFile, targetServerId, queryBuffers);
 
         long endQueryBytes = GC.GetAllocatedBytesForCurrentThread();
         long queryAllocated = endQueryBytes - startQueryBytes;
 
-        Console.WriteLine($"SIMD Average CPU for Entity {targetEntityId}: {averageCpu:F6}%");
+        Console.WriteLine($"SIMD Average CPU Temp for Server {targetServerId}: {averageCpuTemp:F6} °C");
         Console.WriteLine($"Query Execution Heap Allocations: {queryAllocated} bytes (Goal: < 2000 bytes for MMF wrapper objects)");
 
         // 5. Verify Correctness Against Scalar Reference
@@ -116,38 +142,37 @@ class Program
         int count = 0;
         for (int i = 0; i < totalItems; i++)
         {
-            if (compBuffers.EntityIds[i] == targetEntityId)
+            if (compBuffers.ServerIds[i] == targetServerId)
             {
-                sum += compBuffers.CpuUsages[i];
+                sum += compBuffers.CpuTemps[i];
                 count++;
             }
         }
-        double referenceAverageCpu = sum / count;
-        Console.WriteLine($"Scalar Reference Average CPU: {referenceAverageCpu:F6}%");
+        double referenceAverageCpuTemp = sum / count;
+        Console.WriteLine($"Scalar Reference Average CPU Temp: {referenceAverageCpuTemp:F6} °C");
 
-        double diff = Math.Abs(averageCpu - referenceAverageCpu);
+        double diff = Math.Abs(averageCpuTemp - referenceAverageCpuTemp);
         Console.WriteLine($"Exact Difference: {diff:E6}");
 
-        // Using 0.001 tolerance since single-precision float accumulation differences occur due to SIMD instruction order
-        bool cpuMatches = diff < 0.001;
-        Console.WriteLine($"Average CPU Matches: {(cpuMatches ? "PASS" : "FAIL")}");
+        bool cpuTempMatches = diff < 0.001;
+        Console.WriteLine($"Average CPU Temp Matches: {(cpuTempMatches ? "PASS" : "FAIL")}");
 
         // Single-threaded clean allocation test for ingest to verify pure 0 allocations
         Console.WriteLine("\n[5/5] Checking single-threaded core operations...");
         GC.Collect();
         GC.WaitForPendingFinalizers();
 
-        var testBuffer = new HotRingBuffer<TelemetryRow>(1024);
+        var testBuffer = new HotRingBuffer<SystemMetric>(1024);
         long testStartBytes = GC.GetAllocatedBytesForCurrentThread();
 
         for (int i = 0; i < 100; i++)
         {
-            var row = new TelemetryRow
+            var row = new SystemMetric
             {
-                Timestamp = i,
-                CpuUsage = 45.0f,
-                MemUsage = 80.0f,
-                EntityId = 1
+                Time = i,
+                CpuTemp = 55.0f,
+                FanSpeed = 2200.0f,
+                ServerId = 1
             };
             testBuffer.Write(in row);
         }
@@ -156,12 +181,11 @@ class Program
         long testAllocated = testEndBytes - testStartBytes;
         Console.WriteLine($"Core Ingestion Allocations (100 writes): {testAllocated} bytes");
 
-        // We allow minor allocations (< 10 KB) for I/O wrapper objects (FileStream, MemoryMappedFile, view accessor)
         bool zeroCoreAllocations = testAllocated == 0 && queryAllocated < 10000 && compactAllocated < 10000;
 
-        if (cpuMatches && zeroCoreAllocations)
+        if (cpuTempMatches && zeroCoreAllocations)
         {
-            Console.WriteLine("\n🎉 Verification Result: SUCCESS! All systems verified with zero core heap allocations.");
+            Console.WriteLine("\n🎉 Verification Result: SUCCESS! Generated custom table and SIMD query engine verified with zero core heap allocations.");
         }
         else
         {
