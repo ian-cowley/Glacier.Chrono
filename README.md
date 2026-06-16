@@ -231,5 +231,10 @@ Glacier.Chrono/
 
 ---
 
+## 👥 Credits
+Developed by Ian Cowley and Antigravity (Google DeepMind).
+
+---
+
 ## 📄 License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
