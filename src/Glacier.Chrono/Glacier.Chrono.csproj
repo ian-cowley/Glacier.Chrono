@@ -6,6 +6,17 @@
     <Nullable>enable</Nullable>
     <Version>1.0.0</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Authors>ian-cowley</Authors>
+    <Description>Zero-allocation embedded time-series compression engine in C# for .NET 10.0</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Chrono</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>timeseries;database;compression;dotnet;csharp;simd;gorilla;rle;zero-allocation</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\"/>
+  </ItemGroup>
 
 </Project>
