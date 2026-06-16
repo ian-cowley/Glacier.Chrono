@@ -16,6 +16,7 @@ By bypassing heavy ORMs, database servers, and external system dependencies, Gla
 ## 🚀 Key Features
 
 * **Zero-Allocation Ingest & Compression**: The hot paths for write ingestion, column transpositions, and bit-level compressions perform **zero allocations** on the managed heap.
+* **Compile-Time Code Generation (Source Generators)**: Decouples the library from a hardcoded telemetry schema. Annotate any C# struct with `[ChronoTable]`, and the Roslyn Source Generator automatically emits dedicated, zero-allocation compactors and SIMD query engines.
 * **CPU Register-Buffered Bit-Packing**: Utilizes a highly-optimized 64-bit register accumulator for reading and writing bits, avoiding slow bit-by-bit looping and resulting in a **19x performance speedup**.
 * **Hybrid Row-to-Columnar Pivot**: Collects telemetry row-wise in a lock-free ring buffer (AoS), then pivots the layout in memory to columnar (SoA) during background compaction to maximize compression density and SIMD cache locality.
 * **Vectorized (SIMD) Queries**: Leverages portable hardware intrinsics (`Vector<T>` and `Vector256<T>`) to query and aggregate millions of records per second directly on memory-mapped column files.
@@ -120,49 +121,72 @@ Unknown processor
 
 ## 🛠️ Quick Start
 
-### 1. Ingest Data Concurrently
-Define the schema using a layout-packed struct:
+### 1. Define Your Custom Schema
+Annotate a struct with `[ChronoTable]` and specify the compression types for each field using column attributes. The struct must implement `IComparable<TStruct>` to allow sorting:
+
 ```csharp
+using System;
 using System.Runtime.InteropServices;
 using Glacier.Chrono.Storage;
 
+namespace MyApp;
+
+[ChronoTable]
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct TelemetryRow
+public struct SystemMetric : IComparable<SystemMetric>
 {
-    public long Timestamp; // 8 bytes
-    public float CpuUsage; // 4 bytes
-    public float MemUsage; // 4 bytes
-    public int EntityId;   // 4 bytes
+    [Timestamp] // Compresses with Delta-of-Delta
+    public long Time;
+
+    [Metric] // Compresses with Gorilla XOR
+    public float CpuTemp;
+
+    [Metric]
+    public float FanSpeed;
+
+    [Category] // Compresses with Run-Length Encoding
+    public int ServerId;
+
+    public int CompareTo(SystemMetric other) => Time.CompareTo(other.Time);
 }
+```
 
-// Instantiate a lock-free Ring Buffer
+### 2. Ingest Data Concurrently
+Write data concurrently to the circular ring buffer without lock contention:
+
+```csharp
+using Glacier.Chrono.Storage;
+
+// Instantiate the pre-allocated ring buffer
 int bufferCapacity = 16384;
-var ringBuffer = new HotRingBuffer<TelemetryRow>(bufferCapacity);
+var ringBuffer = new HotRingBuffer<SystemMetric>(bufferCapacity);
 
-// Write concurrently
-var record = new TelemetryRow 
+// Ingest records concurrently
+var record = new SystemMetric 
 { 
-    Timestamp = DateTime.UtcNow.Ticks, 
-    CpuUsage = 45.2f, 
-    MemUsage = 80.1f, 
-    EntityId = 1 
+    Time = DateTime.UtcNow.Ticks, 
+    CpuTemp = 45.2f, 
+    FanSpeed = 2100.0f,
+    ServerId = 1 
 };
 ringBuffer.Write(in record);
 ```
 
-### 2. Run Background Compaction
-Periodically compact ingested rows to disk. Compaction converts rows to columns and flushes them to compressed binary format.
+### 3. Run Compaction (AoS to SoA Pivot)
+Background compaction pivots rows into columns and saves them to disk. The source generator automatically generates `SystemMetricCompactor` and `SystemMetricCompactorBuffers` for your custom table:
+
 ```csharp
-using Glacier.Chrono.Storage;
+using MyApp;
 
 long nextSequence = 0;
 int batchSize = 10000;
 string outputDirectory = "./glacier_data";
 
-// Pre-allocate compaction buffer arrays once to ensure zero allocations on the hot path
-var compBuffers = new CompactorBuffers(batchSize);
+// Preallocate buffers once to guarantee zero allocations on the hot path
+var compBuffers = new SystemMetricCompactorBuffers(batchSize);
 
-bool success = Compactor.CompactBatch(
+// Flushes a compressed .glacier chunk file to disk
+bool success = SystemMetricCompactor.CompactBatch(
     ringBuffer, 
     ref nextSequence, 
     batchSize, 
@@ -171,26 +195,27 @@ bool success = Compactor.CompactBatch(
 );
 ```
 
-### 3. Query Column Aggregates with SIMD
-Execute vector-scan average queries over memory-mapped files without loading unneeded columns:
+### 4. Query Column Aggregates with SIMD
+Memory-map and scan the file using the compile-time generated query engine. The generator automatically emits specialized methods (e.g. `GetAverageCpuTempForServerId`) for every combination of metric and category field:
+
 ```csharp
-using Glacier.Chrono.Query;
+using MyApp;
 
 string chunkFilePath = "./glacier_data/chunk_0.glacier";
-int targetEntityId = 1;
+int targetServerId = 1;
 int batchSize = 10000;
 
-// Pre-allocate query buffers to avoid heap allocations
-var queryBuffers = new QueryBuffers(batchSize);
+// Pre-allocate query buffers to avoid heap allocations during query execution
+var queryBuffers = new SystemMetricQueryBuffers(batchSize);
 
-// Scans only the mapped EntityId and CpuUsage columns
-double avgCpu = QueryEngine.GetAverageCpuUsageForEntity(
+// Scans only the mapped CpuTemp and ServerId columns
+double avgCpuTemp = SystemMetricQueryEngine.GetAverageCpuTempForServerId(
     chunkFilePath, 
-    targetEntityId, 
+    targetServerId, 
     queryBuffers
 );
 
-Console.WriteLine($"SIMD Average CPU Usage: {avgCpu}%");
+Console.WriteLine($"SIMD Average CPU Temperature: {avgCpuTemp} °C");
 ```
 
 ---
