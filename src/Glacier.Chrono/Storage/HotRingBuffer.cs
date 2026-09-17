@@ -1,17 +1,35 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Glacier.Chrono.Storage;
 
+/// <summary>
+/// 64-byte cache-line padded sequence slot to eliminate false sharing across CPU cores.
+/// </summary>
+[StructLayout(LayoutKind.Explicit, Size = 64)]
+public struct PaddedSequence
+{
+    [FieldOffset(0)]
+    public long Value;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public PaddedSequence(long value) => Value = value;
+}
+
 public class HotRingBuffer<T> where T : unmanaged
 {
     private readonly T[] _buffer;
-    private readonly long[] _writeSequences;
+    private readonly PaddedSequence[] _writeSequences;
     private readonly int _capacity;
     private readonly int _mask;
     
     private long _writeCursor = 0;
+#pragma warning disable CS0169
+    // 64-byte cache line separation between writeCursor and readProgress
+    private readonly long _pad1, _pad2, _pad3, _pad4, _pad5, _pad6, _pad7;
+#pragma warning restore CS0169
     private long _readProgress = -1L;
 
     public int Capacity => _capacity;
@@ -26,9 +44,12 @@ public class HotRingBuffer<T> where T : unmanaged
         _capacity = RoundToPowerOfTwo(capacity);
         _mask = _capacity - 1;
         _buffer = new T[_capacity];
-        _writeSequences = new long[_capacity];
+        _writeSequences = new PaddedSequence[_capacity];
         
-        Array.Fill(_writeSequences, -1L);
+        for (int i = 0; i < _capacity; i++)
+        {
+            _writeSequences[i].Value = -1L;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -66,7 +87,7 @@ public class HotRingBuffer<T> where T : unmanaged
         long expectedSequence = sequence - _capacity;
         if (expectedSequence < 0) expectedSequence = -1L;
 
-        while (Volatile.Read(ref _writeSequences[index]) != expectedSequence)
+        while (Volatile.Read(ref _writeSequences[index].Value) != expectedSequence)
         {
             Thread.SpinWait(1);
         }
@@ -74,7 +95,7 @@ public class HotRingBuffer<T> where T : unmanaged
         _buffer[index] = item;
 
         // Commit the write by setting the sequence flag to the current sequence
-        Volatile.Write(ref _writeSequences[index], sequence);
+        Volatile.Write(ref _writeSequences[index].Value, sequence);
     }
 
     /// <summary>
@@ -93,7 +114,7 @@ public class HotRingBuffer<T> where T : unmanaged
         {
             long targetSequence = startSequence + i;
             int index = (int)(targetSequence & _mask);
-            if (Volatile.Read(ref _writeSequences[index]) != targetSequence)
+            if (Volatile.Read(ref _writeSequences[index].Value) != targetSequence)
             {
                 return false;
             }
