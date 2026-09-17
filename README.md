@@ -1,3 +1,5 @@
+![Glacier.Chrono Banner](assets/banner.jpg)
+
 # Glacier.Chrono: Zero-Allocation Time-Series Compression Engine
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](#)
