@@ -2,12 +2,13 @@
 
 # Glacier.Chrono: Zero-Allocation Time-Series Compression Engine
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](#)
-[![Target Framework](https://img.shields.io/badge/.NET-10.0-blue.svg)](#)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
+[![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
+[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Chrono.svg)](https://www.nuget.org/packages/Glacier.Chrono/)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Chrono.svg)](https://www.nuget.org/packages/Glacier.Chrono/)
+[![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
 [![Zero-Allocation](https://img.shields.io/badge/Allocations-Zero%20Heap-orange.svg)](#)
-[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Chrono.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Chrono/)
-[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Chrono.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Chrono/)
 
 Glacier.Chrono is an embedded, in-process time-series database engine designed for extreme write-throughput and zero-allocation query execution in **.NET 10**. 
 
