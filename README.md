@@ -259,6 +259,14 @@ Glacier.Chrono/
 
 ---
 
+## 🆕 What's New in v1.0.1
+
+- **128-byte padded `HotRingBuffer` cursors** — eliminates false sharing on multi-core systems where producer and consumer cache lines previously shared the same 64-byte boundary.
+- **Progressive exponential back-off** — replaces tight spin loops in the compaction path, reducing CPU burn under backpressure.
+- **Full test suite authored from scratch** — **80 tests** covering ring buffer concurrency, compression codecs, and query engine correctness.
+
+---
+
 ## 👥 Credits
 Developed by Ian Cowley and Antigravity (Google DeepMind).
 
