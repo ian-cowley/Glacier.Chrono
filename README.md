@@ -12,38 +12,40 @@
 [![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
 
-Glacier.Chrono is an embedded, in-process time-series database engine designed for extreme write-throughput and zero-allocation query execution in **.NET 10**. 
+Glacier.Chrono is an embedded, Native AOT-compatible, in-process time-series database engine designed for extreme write-throughput and zero-allocation query execution in **.NET 10**.
 
-By bypassing heavy ORMs, database servers, and external system dependencies, Glacier.Chrono delivers timeseries compression ratios of **90%+** using standard time-series compression algorithms (inspired by Facebook Gorilla and TimescaleDB) running entirely in-process in C#.
+By bypassing heavy ORMs, external database servers, and IPC overhead, Glacier.Chrono delivers time-series compression ratios of **90%+** using specialized time-series codecs (Delta-of-Delta, Gorilla XOR, and Integer RLE) paired with zone-map chunk pruning and double-precision SIMD scans directly in C#.
 
 ---
 
 ## 🚀 Key Features
 
-* **Zero-Allocation Ingest & Compression**: The hot paths for write ingestion, column transpositions, and bit-level compressions perform **zero allocations** on the managed heap.
-* **Compile-Time Code Generation (Source Generators)**: Decouples the library from a hardcoded telemetry schema. Annotate any C# struct with `[ChronoTable]`, and the Roslyn Source Generator automatically emits dedicated, zero-allocation compactors and SIMD query engines.
-* **CPU Register-Buffered Bit-Packing**: Utilizes a highly-optimized 64-bit register accumulator for reading and writing bits, avoiding slow bit-by-bit looping and resulting in a **19x performance speedup**.
-* **Hybrid Row-to-Columnar Pivot**: Collects telemetry row-wise in a lock-free ring buffer (AoS), then pivots the layout in memory to columnar (SoA) during background compaction to maximize compression density and SIMD cache locality.
-* **Vectorized (SIMD) Queries**: Leverages portable hardware intrinsics (`Vector<T>` and `Vector256<T>`) to query and aggregate millions of records per second directly on memory-mapped column files.
-* **Virtual Memory File Projection**: Maps cold storage chunk files to memory via `MemoryMappedFile` projection, allowing queries to scan datasets **much larger than physical memory** without triggering GC pressure.
+* **Zero-Allocation Lock-Free Ingest**: Concurrent MPMC ingestion into a cache-line isolated `HotRingBuffer<T>` (`PaddedCursor` + `PaddedSequence`) with poison-free timeout and `CancellationToken` recovery.
+* **Bundled Roslyn Source Generator (`[ChronoTable]`)**: `Glacier.Chrono.Generator` ships directly inside the `Glacier.Chrono` NuGet package (`analyzers/dotnet/cs`). Annotate any unmanaged struct with `[ChronoTable]` (with any number of `[Metric]` and `[Category]` columns, including wide schemas and 0-category tables) to emit strongly-typed compactors and SIMD query engines at compile time.
+* **64-Bit Register-Buffered Bit-Packing**: Full `1..64`-bit unaligned `BitWriter` and `BitReader` accumulators with cross-boundary splitting and zero heap allocations.
+* **Zone-Map `[MinTimestamp, MaxTimestamp]` Pruning & Range Queries**: `.glacier` v2 chunks store per-chunk timestamp bounds in a dynamic 64-byte-aligned header (`stackalloc` inspected). Disjoint chunks are pruned in **O(1)** without memory-mapping; wholly-contained chunks skip timestamp decompression entirely; partially-overlapping chunks binary-search `[startIndex, endIndex)` and run vectorized `Vector.Widen` double-precision scans.
+* **Partial-Batch Compaction & Multi-Chunk Directory Scans**: Flush arbitrary tail/partial batches safely using reusable pre-allocated `CompactorBuffers`, and query across entire `.glacier` directories in a single call.
+* **Native AOT Ready**: Built with `<IsAotCompatible>true</IsAotCompatible>` and zero runtime reflection.
 
 ---
 
 ## 🏛️ Architectural Layout
 
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the complete binary format specification, concurrency invariants, and query pipeline details.
+
 ```
                   ┌───────────────────────────────────────────────┐
                   │          Concurrent Ingest Threads            │
                   └───────────────────────┬───────────────────────┘
-                                          │  1. Zero-Allocation Ingest (Write)
+                                          │  1. Lock-Free CAS Ingest (Write / TryWrite)
                                           ▼
                   ┌───────────────────────────────────────────────┐
-                  │    HotRingBuffer<TelemetryRow> (AoS Layout)   │
+                  │      HotRingBuffer<TStruct> (AoS Layout)      │
                   └───────────────────────┬───────────────────────┘
-                                          │  2. Background Pivot (AoS -> SoA)
+                                          │  2. Sort + AoS -> SoA Pivot (Full or Partial Batch)
                                           ▼
                   ┌───────────────────────────────────────────────┐
-                  │    Columnar Spans (Timestamps, CPUs, Mem...)  │
+                  │    Columnar Spans (Timestamps, Metrics, Cats) │
                   └─────────┬─────────────────┬─────────────────┬─┘
                             │                 │                 │
                             │ 3. DoD          │ 3. Gorilla XOR  │ 3. RLE
@@ -53,47 +55,24 @@ By bypassing heavy ORMs, database servers, and external system dependencies, Gla
                   └─────────┬───────┘ └───────┬───────┘ └───────┬───────┘
                             │                 │                 │
                             └─────────────────┼─────────────────┘
-                                              │ 4. Single-pass Offset Write
+                                              │ 4. Dynamic 64B-Aligned Header + Zone-Map Bounds
                                               ▼
                                  ┌────────────────────────┐
-                                 │  chunk_*.glacier file  │
+                                 │  chunk_*.glacier (v2)  │
                                  └────────────┬───────────┘
                                               │
-                                              │ 5. MemoryMappedFile Projection
+                                              │ 5. O(1) Zone-Map Prune + MMF Column Projection
                                               ▼
                                  ┌────────────────────────┐
-                                 │ Vectorized QueryEngine │ (SIMD average, sums, filters)
+                                 │ Vectorized QueryEngine │ (SIMD Vector.Widen double precision)
                                  └────────────────────────┘
 ```
-
-### 1. Ingestion Layer (`HotRingBuffer<T>`)
-Telemetry writes are written into a pre-allocated circular ring buffer. A lock-free write cursor is advanced atomically using `Interlocked.Increment`, allowing multiple concurrent ingestion threads to record telemetry without lock contention or memory allocations.
-
-### 2. The Compaction Pivot (`Compactor`)
-When a batch size (e.g., 10,000 rows) is reached, a background thread transposes the Array of Structs (AoS) format into a Struct of Arrays (SoA) format. Pivoting elements into contiguous arrays by data type prepares columns for compression algorithms tailored to their data distribution.
-
-### 3. Bit-Packing & Compression Engine
-* **Timestamps (Delta-of-Delta)**: Computes the difference in intervals (DoD). If data arrives at perfectly regular intervals (DoD = 0), it is encoded as a single bit.
-* **Floating-Point Metrics (Gorilla XOR)**: Computes the XOR between consecutive floats. Zero leading/trailing bits are stripped and only the meaningful bits are bit-packed, achieving high compression ratios for slowly changing metrics (e.g. CPU or temperature logs).
-* **Integers/Enums (RLE)**: Identifies consecutive repeating values and packs them into `[Value, Count]` pairs.
-* **The 64-bit Accumulator Trick**: Instead of writing bits individually, the `BitWriter` and `BitReader` accumulate bits in a CPU register (`ulong`). Bytes are written to memory in bulk only when the accumulator reaches capacity, eliminating loop overhead.
-
-### 4. Query Execution (`QueryEngine`)
-Analytical queries project only the relevant columns into the virtual address space using memory-mapped views. The `QueryEngine` applies vectorized logic (`Vector<T>`) to decode and filter values directly in memory-mapped views, enabling sub-millisecond aggregates over millions of rows with negligible heap footprint.
 
 ---
 
 ## ⚡ Performance Benchmarks
 
-Below are the official benchmark results executed on **Windows 11** using **.NET SDK 10.0.301** on a machine supporting AVX-512 vector extensions.
-
-```
-BenchmarkDotNet v0.14.0, Windows 11 (10.0.26200.8655)
-Unknown processor
-.NET SDK 10.0.301
-  [Host]     : .NET 10.0.9 (10.0.926.27113), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
-  DefaultJob : .NET 10.0.9 (10.0.926.27113), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
-```
+Executed on **Windows 11** using **.NET SDK 10.0** on an AVX-512 x64 host:
 
 | Method | N | Mean | Gen 0 | Gen 1 | Gen 2 | Allocated | Throughput (Values/sec) |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -104,33 +83,19 @@ Unknown processor
 | **TimestampDecompressDoD** | 10000 | 10.32 μs | - | - | - | **0 B** | **969.4M values/sec** |
 | **IntegerCompressRle** | 10000 | 19.81 μs | - | - | - | **0 B** | **504.7M values/sec** |
 | **IntegerDecompressRle** | 10000 | 34.39 μs | - | - | - | **0 B** | **290.7M values/sec** |
-| **QueryEngineSIMD** | 10000 | 325.96 μs | - | - | - | **577 B** ** | **30.7M records/sec** |
+| **QueryEngineSIMD** | 10000 | 325.96 μs | - | - | - | **< 600 B** ** | **30.7M records/sec** |
 
-*\* Allocations in `HotIngestSingleThreaded` reflect the setup instantiation of the new ring buffer array inside the benchmark loop.*  
-*\*\* Allocations in `QueryEngineSIMD` are exclusively due to the .NET BCL `MemoryMappedFile` and `MemoryMappedViewAccessor` wrapper instances, which are garbage-collected outside of the hot path.*
-
----
-
-## 📊 Comparison: Glacier.Chrono vs. TimescaleDB
-
-| Feature | TimescaleDB | Glacier.Chrono |
-| :--- | :--- | :--- |
-| **Execution Model** | External Database Server (PostgreSQL Extension) | Embedded, in-process C# Class Library |
-| **Ingestion Latency** | High (Network, IPC, Transaction Locks, SQL Parsing) | Ultra-low (Lock-free Ring Buffer writes) |
-| **Compression Quality** | High (DoD, Gorilla, RLE, Dictionary) | Identical (Custom C# implementations of DoD, Gorilla, RLE) |
-| **Memory Allocation** | Relies on PostgreSQL memory buffers | **Zero** heap allocations during ingestion & compression |
-| **Scale Limits** | Scalable across disk storage clusters | Scalable via Memory-Mapped files larger than RAM |
-| **Deployment Complexity**| High (Docker, PG configuration, backup tooling) | Zero (Packaged as a lightweight NuGet library) |
+*\* Allocations in `HotIngestSingleThreaded` reflect instantiating the `HotRingBuffer` inside the benchmark method; steady-state `Write`/`TryWrite` allocates **0 bytes**.*  
+*\*\* Allocations in `QueryEngineSIMD` come solely from OS file/memory-mapping handle wrappers; header inspection uses `stackalloc` and column scans allocate **0 bytes**.*
 
 ---
 
 ## 🛠️ Quick Start
 
 ### 1. Define Your Custom Schema
-Annotate a struct with `[ChronoTable]` and specify the compression types for each field using column attributes. The struct must implement `IComparable<TStruct>` to allow sorting:
+Install `Glacier.Chrono` (the Roslyn Source Generator is bundled automatically) and annotate an unmanaged struct with `[ChronoTable]`:
 
 ```csharp
-using System;
 using System.Runtime.InteropServices;
 using Glacier.Chrono.Storage;
 
@@ -138,9 +103,9 @@ namespace MyApp;
 
 [ChronoTable]
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct SystemMetric : IComparable<SystemMetric>
+public struct SystemMetric
 {
-    [Timestamp] // Compresses with Delta-of-Delta
+    [Timestamp] // Compresses with Delta-of-Delta + indexes [MinTimestamp, MaxTimestamp] zone-map
     public long Time;
 
     [Metric] // Compresses with Gorilla XOR
@@ -151,76 +116,68 @@ public struct SystemMetric : IComparable<SystemMetric>
 
     [Category] // Compresses with Run-Length Encoding
     public int ServerId;
-
-    public int CompareTo(SystemMetric other) => Time.CompareTo(other.Time);
 }
 ```
 
 ### 2. Ingest Data Concurrently
-Write data concurrently to the circular ring buffer without lock contention:
+Write data concurrently across threads into the lock-free ring buffer:
 
 ```csharp
 using Glacier.Chrono.Storage;
 
-// Instantiate the pre-allocated ring buffer
-int bufferCapacity = 16384;
-var ringBuffer = new HotRingBuffer<SystemMetric>(bufferCapacity);
+var ringBuffer = new HotRingBuffer<SystemMetric>(capacity: 16384);
 
-// Ingest records concurrently
-var record = new SystemMetric 
-{ 
-    Time = DateTime.UtcNow.Ticks, 
-    CpuTemp = 45.2f, 
+var record = new SystemMetric
+{
+    Time = DateTime.UtcNow.Ticks,
+    CpuTemp = 45.2f,
     FanSpeed = 2100.0f,
-    ServerId = 1 
+    ServerId = 1
 };
-ringBuffer.Write(in record);
+
+// Bounded spin-wait with timeout & CancellationToken support
+ringBuffer.Write(in record, TimeSpan.FromSeconds(5), cancellationToken);
 ```
 
-### 3. Run Compaction (AoS to SoA Pivot)
-Background compaction pivots rows into columns and saves them to disk. The source generator automatically generates `SystemMetricCompactor` and `SystemMetricCompactorBuffers` for your custom table:
-
+### 3. Compact Full or Partial Batches to `.glacier` Chunks
 ```csharp
 using MyApp;
 
 long nextSequence = 0;
-int batchSize = 10000;
+int maxBatchSize = 10_000;
 string outputDirectory = "./glacier_data";
 
-// Preallocate buffers once to guarantee zero allocations on the hot path
-var compBuffers = new SystemMetricCompactorBuffers(batchSize);
+// Preallocate reusable buffers once
+var compBuffers = new SystemMetricCompactorBuffers(maxBatchSize);
 
-// Flushes a compressed .glacier chunk file to disk
-bool success = SystemMetricCompactor.CompactBatch(
-    ringBuffer, 
-    ref nextSequence, 
-    batchSize, 
-    outputDirectory, 
-    compBuffers
-);
+// Supports full batches (10,000) or partial tail flushes (e.g., 500 <= maxBatchSize)
+bool flushed = SystemMetricCompactor.CompactBatch(
+    ringBuffer,
+    ref nextSequence,
+    batchSize: 10_000,
+    outputDirectory,
+    compBuffers);
 ```
 
-### 4. Query Column Aggregates with SIMD
-Memory-map and scan the file using the compile-time generated query engine. The generator automatically emits specialized methods (e.g. `GetAverageCpuTempForServerId`) for every combination of metric and category field:
-
+### 4. Execute Zone-Map Pruned & SIMD Time-Range Queries
 ```csharp
 using MyApp;
 
-string chunkFilePath = "./glacier_data/chunk_0.glacier";
-int targetServerId = 1;
-int batchSize = 10000;
+var queryBuffers = new SystemMetricQueryBuffers(maxBatchSize: 10_000);
 
-// Pre-allocate query buffers to avoid heap allocations during query execution
-var queryBuffers = new SystemMetricQueryBuffers(batchSize);
+// Single-chunk filtered query
+double avgServerTemp = SystemMetricQueryEngine.GetAverageCpuTempForServerId(
+    "./glacier_data/chunk_0.glacier",
+    targetServerId: 1,
+    queryBuffers);
 
-// Scans only the mapped CpuTemp and ServerId columns
-double avgCpuTemp = SystemMetricQueryEngine.GetAverageCpuTempForServerId(
-    chunkFilePath, 
-    targetServerId, 
-    queryBuffers
-);
-
-Console.WriteLine($"SIMD Average CPU Temperature: {avgCpuTemp} °C");
+// Multi-chunk directory time-range query with O(1) zone-map chunk pruning
+double windowAvgTemp = SystemMetricQueryEngine.GetAverageCpuTempForServerIdInDirectory(
+    "./glacier_data",
+    targetServerId: 1,
+    startTimestamp: windowStartTicks,
+    endTimestamp: windowEndTicks,
+    queryBuffers);
 ```
 
 ---
@@ -229,43 +186,46 @@ Console.WriteLine($"SIMD Average CPU Temperature: {avgCpuTemp} °C");
 
 ```
 Glacier.Chrono/
-├── Glacier.Chrono.slnx       # Solution configuration file
-├── spec.md                   # Core architectural specification
+├── Glacier.Chrono.slnx            # Solution configuration
+├── ARCHITECTURE.md                # Detailed internals, v2 chunk spec, and concurrency design
+├── spec.md                        # Original design specification
 ├── src/
-│   └── Glacier.Chrono/       # Library project
-│       ├── Compression/      # Compressors (DoD, Gorilla, RLE, BitReaderWriter)
-│       ├── Storage/          # HotRingBuffer, TelemetryRow, Compactor
-│       ├── Query/            # SIMD QueryEngine
-│       └── Glacier.Chrono.csproj
+│   ├── Glacier.Chrono/            # Core library (Storage, Compression, SIMD QueryEngine)
+│   └── Glacier.Chrono.Generator/  # Roslyn Incremental Source Generator (bundled in nupkg)
+├── tests/
+│   └── Glacier.Chrono.Tests/      # Unit, SIMD, generator, concurrency, and stress tests
 └── samples/
-    ├── Glacier.Chrono.Demo/        # Correctness and zero-allocation verification app
-    └── Glacier.Chrono.Benchmarks/  # BenchmarkDotNet performance evaluation suite
+    ├── Glacier.Chrono.Demo/       # End-to-end verification app
+    └── Glacier.Chrono.Benchmarks/ # BenchmarkDotNet suite
 ```
 
 ---
 
 ## 🧪 Building and Testing
 
-1. **Build the solution**:
-   ```bash
-   dotnet build
-   ```
-2. **Execute correct-by-construction demo**:
-   ```bash
-   dotnet run --project samples/Glacier.Chrono.Demo/Glacier.Chrono.Demo.csproj -c Release
-   ```
-3. **Execute BenchmarkDotNet**:
-   ```bash
-   dotnet run --project samples/Glacier.Chrono.Benchmarks/Glacier.Chrono.Benchmarks.csproj -c Release
-   ```
+```bash
+# Build all projects in Release (TreatWarningsAsErrors enabled)
+dotnet build --configuration Release
+
+# Run the full unit & stress test suite
+dotnet test --configuration Release
+
+# Run the end-to-end verification demo
+dotnet run --project samples/Glacier.Chrono.Demo/Glacier.Chrono.Demo.csproj -c Release
+```
 
 ---
 
-## 🆕 What's New in v1.0.1
+## 🆕 What's New in v1.1.0
 
-- **128-byte padded `HotRingBuffer` cursors** — eliminates false sharing on multi-core systems where producer and consumer cache lines previously shared the same 64-byte boundary.
-- **Progressive exponential back-off** — replaces tight spin loops in the compaction path, reducing CPU burn under backpressure.
-- **Full test suite authored from scratch** — **80 tests** covering ring buffer concurrency, compression codecs, and query engine correctness.
+- **Poison-Free `HotRingBuffer<T>` Slot Coordination** — verifies both ring capacity and prior-lap slot readiness *before* advancing `_writeCursor`, eliminating permanent sequence poisoning when `TryWrite` times out or is canceled.
+- **Full 64-Bit Unaligned `BitWriter` / `BitReader` & Hardened Codecs** — supports `1..64`-bit writes/reads across any bit alignment (`0..7`), explicit `unchecked` modular DoD arithmetic, and strict `InvalidDataException` validation on corrupt Gorilla streams.
+- **`.glacier` v2 Dynamic Headers & Zone-Map Range Queries** — removes the 64-byte / 3-column ceiling with dynamic 64-byte-aligned headers, adds `[MinTimestamp, MaxTimestamp]` O(1) chunk pruning, skips timestamp decompression on wholly-contained chunks, binary-searches partial overlaps, and widens SIMD sums to `double` (`Vector.Widen`).
+- **Partial-Batch Compaction & Bundled Source Generator** — safely compacts partial batches (`batchSize <= buffers.RowBuffer.Length`), supports 0-category and wide multi-column `[ChronoTable]` structs, enables `<IsAotCompatible>true</IsAotCompatible>`, and bundles `Glacier.Chrono.Generator.dll` directly inside `Glacier.Chrono.nupkg`.
+
+### v1.0.1
+- **128-byte padded `HotRingBuffer` cursors** — eliminates false sharing across producer and consumer cache lines.
+- **Bounded spin-wait backoff** and initial unit/stress test suite.
 
 ---
 

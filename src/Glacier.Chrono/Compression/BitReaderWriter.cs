@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 
 namespace Glacier.Chrono.Compression;
 
@@ -27,11 +28,35 @@ public ref struct BitWriter
 
     public void WriteBits(ulong value, int count)
     {
+        if ((uint)count > 64)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count), "Bit count must be between 0 and 64.");
+        }
+
         if (count == 0) return;
 
         // Mask value to ensure no junk bits above the requested count
-        ulong mask = count >= 64 ? ulong.MaxValue : (1UL << count) - 1;
+        ulong mask = count == 64 ? ulong.MaxValue : (1UL << count) - 1;
         value &= mask;
+
+        if (count > 64 - _bitCount)
+        {
+            // Split cleanly across the 64-bit accumulator boundary (_bitCount is 1..7)
+            int space = 64 - _bitCount;
+            int rem = count - space;
+
+            if (_byteIndex + 8 > _destination.Length)
+            {
+                throw new InvalidOperationException("Buffer overflow: Destination span is too small.");
+            }
+
+            _accumulator |= value >> rem;
+            BinaryPrimitives.WriteUInt64BigEndian(_destination.Slice(_byteIndex, 8), _accumulator);
+            _byteIndex += 8;
+            _accumulator = (value & ((1UL << rem) - 1)) << (64 - rem);
+            _bitCount = rem;
+            return;
+        }
 
         _accumulator |= value << (64 - _bitCount - count);
         _bitCount += count;
@@ -103,6 +128,11 @@ public ref struct BitReader
 
     public ulong ReadBits(int count)
     {
+        if ((uint)count > 64)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count), "Bit count must be between 0 and 64.");
+        }
+
         if (count == 0) return 0;
 
         ulong result = 0;
@@ -120,12 +150,12 @@ public ref struct BitReader
             }
 
             int bitsToTake = Math.Min(remaining, _bitsLeft);
-            
-            // Extract the top 'bitsToTake' from the accumulator
-            ulong val = _accumulator >> (64 - bitsToTake);
-            result = (result << bitsToTake) | val;
 
-            _accumulator <<= bitsToTake;
+            // Extract the top 'bitsToTake' from the accumulator (guard against C# << 64 shift masking)
+            ulong val = _accumulator >> (64 - bitsToTake);
+            result = bitsToTake == 64 ? val : (result << bitsToTake) | val;
+
+            _accumulator = bitsToTake == 64 ? 0UL : _accumulator << bitsToTake;
             _bitsLeft -= bitsToTake;
             remaining -= bitsToTake;
         }

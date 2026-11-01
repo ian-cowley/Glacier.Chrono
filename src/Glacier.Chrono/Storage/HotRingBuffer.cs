@@ -97,6 +97,8 @@ public class HotRingBuffer<T> where T : unmanaged
 
     /// <summary>
     /// Writes an item to the ring buffer with explicit timeout and cancellation token.
+    /// Throws <see cref="TimeoutException"/> if the buffer remains full beyond <paramref name="timeout"/>,
+    /// or <see cref="OperationCanceledException"/> if <paramref name="cancellationToken"/> is canceled.
     /// </summary>
     public void Write(in T item, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
@@ -108,8 +110,10 @@ public class HotRingBuffer<T> where T : unmanaged
 
     /// <summary>
     /// Attempts to write an item to the ring buffer within the specified timeout.
-    /// Employs bounded spin-wait with exponential backoff and prevents sequence poisoning.
-    /// Returns true if written successfully; false if timed out or cancelled.
+    /// Employs bounded spin-wait and verifies both reader progress and slot readiness prior to advancing the write cursor,
+    /// guaranteeing that neither timeout nor cancellation can orphan a sequence slot.
+    /// Returns <see langword="true"/> if written successfully; <see langword="false"/> if timed out.
+    /// Throws <see cref="OperationCanceledException"/> if <paramref name="cancellationToken"/> is canceled.
     /// </summary>
     public bool TryWrite(in T item, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
@@ -117,9 +121,9 @@ public class HotRingBuffer<T> where T : unmanaged
         long timeoutTicks = (long)(timeout.TotalSeconds * Stopwatch.Frequency);
 
         SpinWait spinner = default;
-        long sequence;
 
-        // Step 1: Reserve sequence atomically only when space is confirmed
+        // Reserve sequence atomically ONLY when both free capacity and previous-cycle slot completion are confirmed.
+        // Timeout and cancellation occur strictly before _writeCursor is incremented so no sequence is ever orphaned.
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -127,8 +131,13 @@ public class HotRingBuffer<T> where T : unmanaged
             long currentWriteCursor = Volatile.Read(ref _writeCursor.Value);
             long currentReadProgress = Volatile.Read(ref _readProgress.Value);
 
-            // Check if ring buffer is full
-            if (currentWriteCursor - _capacity > currentReadProgress)
+            int index = (int)(currentWriteCursor & _mask);
+            long expectedSequence = currentWriteCursor - _capacity;
+            if (expectedSequence < 0) expectedSequence = -1L;
+
+            // Wait if ring buffer is full OR previous-lap writer on this slot has not yet committed
+            if (currentWriteCursor - _capacity > currentReadProgress ||
+                Volatile.Read(ref _writeSequences[index].Value) != expectedSequence)
             {
                 if (Stopwatch.GetTimestamp() - startTimestamp > timeoutTicks)
                 {
@@ -138,48 +147,29 @@ public class HotRingBuffer<T> where T : unmanaged
                 continue;
             }
 
-            // Attempt CAS to reserve slot
+            // Attempt CAS to claim sequence; upon winning, immediately write payload and publish sequence
             if (Interlocked.CompareExchange(ref _writeCursor.Value, currentWriteCursor + 1, currentWriteCursor) == currentWriteCursor)
             {
-                sequence = currentWriteCursor;
-                break;
+                _buffer[index] = item;
+                Volatile.Write(ref _writeSequences[index].Value, currentWriteCursor);
+                return true;
             }
         }
-
-        int index = (int)(sequence & _mask);
-
-        // Step 2: Coordinate with slow writer from the previous cycle on this slot
-        long expectedSequence = sequence - _capacity;
-        if (expectedSequence < 0) expectedSequence = -1L;
-
-        spinner.Reset();
-        while (Volatile.Read(ref _writeSequences[index].Value) != expectedSequence)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (Stopwatch.GetTimestamp() - startTimestamp > timeoutTicks)
-            {
-                // Slot delayed by previous writer. Emergency commit to avoid poisoning downstream reads:
-                return false;
-            }
-            spinner.SpinOnce();
-        }
-
-        // Step 3: Write payload
-        _buffer[index] = item;
-
-        // Step 4: Commit sequence
-        Volatile.Write(ref _writeSequences[index].Value, sequence);
-        return true;
     }
 
     /// <summary>
     /// Tries to read a batch of items from the ring buffer.
-    /// Returns true if all items in the requested sequence range are fully written.
-    /// Otherwise returns false without modifying the destination span.
+    /// Returns <see langword="true"/> if all items in the requested sequence range are fully written;
+    /// otherwise returns <see langword="false"/> without modifying the destination span.
+    /// Throws <see cref="ArgumentOutOfRangeException"/> if <paramref name="destination"/> length exceeds ring buffer capacity.
     /// </summary>
     public bool TryReadBatch(long startSequence, Span<T> destination)
     {
+        if (destination.Length > _capacity)
+        {
+            throw new ArgumentOutOfRangeException(nameof(destination), "Batch size cannot exceed ring buffer capacity.");
+        }
+
         if (destination.IsEmpty) return true;
 
         int batchSize = destination.Length;

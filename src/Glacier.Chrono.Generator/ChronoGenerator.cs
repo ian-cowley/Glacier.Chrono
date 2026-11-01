@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 using System.Text;
 using Microsoft.CodeAnalysis;
@@ -9,123 +10,98 @@ using Microsoft.CodeAnalysis.Text;
 namespace Glacier.Chrono.Generator;
 
 [Generator]
-public class ChronoGenerator : IIncrementalGenerator
+public sealed class ChronoGenerator : IIncrementalGenerator
 {
+    private const string ChronoTableAttributeMetadataName = "Glacier.Chrono.Storage.ChronoTableAttribute";
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        // 1. Filter for structs decorated with [ChronoTable]
-        IncrementalValuesProvider<StructDeclarationSyntax> structDeclarations = context.SyntaxProvider
-            .CreateSyntaxProvider(
-                predicate: static (s, _) => IsSyntaxTargetForGeneration(s),
-                transform: static (ctx, _) => GetSemanticTargetForGeneration(ctx))
-            .Where(static m => m is not null)!;
+        IncrementalValuesProvider<ChronoTableModel?> tableModels = context.SyntaxProvider
+            .ForAttributeWithMetadataName(
+                fullyQualifiedMetadataName: ChronoTableAttributeMetadataName,
+                predicate: static (node, _) => node is StructDeclarationSyntax,
+                transform: static (ctx, _) => ExtractModel(ctx))
+            .Where(static m => m is not null);
 
-        // 2. Combine with Compilation to get semantic symbols
-        IncrementalValueProvider<(Compilation, System.Collections.Immutable.ImmutableArray<StructDeclarationSyntax>)> compilationAndStructs =
-            context.CompilationProvider.Combine(structDeclarations.Collect());
-
-        // 3. Register source output
-        context.RegisterSourceOutput(compilationAndStructs,
-            static (spc, source) => Execute(source.Item1, source.Item2, spc));
-    }
-
-    private static bool IsSyntaxTargetForGeneration(SyntaxNode node)
-    {
-        return node is StructDeclarationSyntax structDecl && structDecl.AttributeLists.Count > 0;
-    }
-
-    private static StructDeclarationSyntax? GetSemanticTargetForGeneration(GeneratorSyntaxContext context)
-    {
-        var structDecl = (StructDeclarationSyntax)context.Node;
-        foreach (var attributeList in structDecl.AttributeLists)
+        context.RegisterSourceOutput(tableModels, static (spc, model) =>
         {
-            foreach (var attribute in attributeList.Attributes)
+            if (model is not null)
             {
-                var name = attribute.Name.ToString();
-                if (name.Contains("ChronoTable"))
-                {
-                    return structDecl;
-                }
+                GenerateCodeForStruct(model, spc);
             }
-        }
-        return null;
+        });
     }
 
-    private static void Execute(Compilation compilation, System.Collections.Immutable.ImmutableArray<StructDeclarationSyntax> structs, SourceProductionContext context)
+    private static ChronoTableModel? ExtractModel(GeneratorAttributeSyntaxContext context)
     {
-        if (structs.IsDefaultOrEmpty)
-            return;
-
-        foreach (var structDecl in structs.Distinct())
+        if (context.TargetSymbol is not INamedTypeSymbol structSymbol)
         {
-            var semanticModel = compilation.GetSemanticModel(structDecl.SyntaxTree);
-            if (semanticModel.GetDeclaredSymbol(structDecl) is not INamedTypeSymbol structSymbol)
-                continue;
-
-            GenerateCodeForStruct(structSymbol, context);
+            return null;
         }
-    }
 
-    private static void GenerateCodeForStruct(INamedTypeSymbol structSymbol, SourceProductionContext context)
-    {
         string structName = structSymbol.Name;
         string ns = structSymbol.ContainingNamespace.IsGlobalNamespace
-            ? ""
+            ? string.Empty
             : structSymbol.ContainingNamespace.ToDisplayString();
 
         string? timestampField = null;
-        var metrics = new List<string>();
-        var categories = new List<string>();
+        var metrics = ImmutableArray.CreateBuilder<string>();
+        var categories = ImmutableArray.CreateBuilder<string>();
 
-        foreach (var member in structSymbol.GetMembers())
+        foreach (ISymbol member in structSymbol.GetMembers())
         {
-            if (member is IFieldSymbol fieldSymbol)
+            if (member is not IFieldSymbol && member is not IPropertySymbol)
             {
-                foreach (var attr in fieldSymbol.GetAttributes())
-                {
-                    var attrName = attr.AttributeClass?.Name;
-                    if (attrName == "TimestampAttribute")
-                    {
-                        timestampField = fieldSymbol.Name;
-                    }
-                    else if (attrName == "MetricAttribute")
-                    {
-                        metrics.Add(fieldSymbol.Name);
-                    }
-                    else if (attrName == "CategoryAttribute")
-                    {
-                        categories.Add(fieldSymbol.Name);
-                    }
-                }
+                continue;
             }
-            else if (member is IPropertySymbol propSymbol)
+
+            foreach (AttributeData attr in member.GetAttributes())
             {
-                foreach (var attr in propSymbol.GetAttributes())
+                string? attrName = attr.AttributeClass?.Name;
+                if (attrName == "TimestampAttribute")
                 {
-                    var attrName = attr.AttributeClass?.Name;
-                    if (attrName == "TimestampAttribute")
-                    {
-                        timestampField = propSymbol.Name;
-                    }
-                    else if (attrName == "MetricAttribute")
-                    {
-                        metrics.Add(propSymbol.Name);
-                    }
-                    else if (attrName == "CategoryAttribute")
-                    {
-                        categories.Add(propSymbol.Name);
-                    }
+                    timestampField = member.Name;
+                }
+                else if (attrName == "MetricAttribute")
+                {
+                    metrics.Add(member.Name);
+                }
+                else if (attrName == "CategoryAttribute")
+                {
+                    categories.Add(member.Name);
                 }
             }
         }
 
-        if (timestampField == null)
+        if (timestampField is null)
         {
-            return; // Must have at least a timestamp
+            return null;
         }
 
-        var sb = new StringBuilder();
+        return new ChronoTableModel(
+            structName,
+            ns,
+            timestampField,
+            metrics.ToImmutable(),
+            categories.ToImmutable());
+    }
+
+    private static void GenerateCodeForStruct(ChronoTableModel model, SourceProductionContext context)
+    {
+        string structName = model.StructName;
+        string ns = model.Namespace;
+        string timestampField = model.TimestampField;
+        ImmutableArray<string> metrics = model.Metrics;
+        ImmutableArray<string> categories = model.Categories;
+
+        // Dynamic 64-byte-aligned v2 header:
+        // Magic(4) + Version(4) + RowCount(4) + MinTs(8) + MaxTs(8) + Ts(12) + N * 12
+        int rawHeaderBytes = 40 + (metrics.Length + categories.Length) * 12;
+        int headerSize = (rawHeaderBytes + 63) & ~63;
+
+        var sb = new StringBuilder(8192);
         sb.AppendLine("// <auto-generated />");
+        sb.AppendLine("#nullable enable");
         if (!string.IsNullOrEmpty(ns))
         {
             sb.AppendLine($"namespace {ns};");
@@ -139,42 +115,44 @@ public class ChronoGenerator : IIncrementalGenerator
         sb.AppendLine("using System.Numerics;");
         sb.AppendLine("using Glacier.Chrono.Compression;");
         sb.AppendLine("using Glacier.Chrono.Storage;");
+        sb.AppendLine("using Microsoft.Win32.SafeHandles;");
         sb.AppendLine();
 
         // 1. CompactorBuffers
-        sb.AppendLine($"public class {structName}CompactorBuffers");
+        sb.AppendLine($"public sealed class {structName}CompactorBuffers");
         sb.AppendLine("{");
         sb.AppendLine($"    public readonly {structName}[] RowBuffer;");
         sb.AppendLine("    public readonly long[] Timestamps;");
-        foreach (var m in metrics)
+        foreach (string m in metrics)
             sb.AppendLine($"    public readonly float[] {m}s;");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"    public readonly int[] {c}s;");
         sb.AppendLine();
         sb.AppendLine("    public readonly byte[] CompressedTimestamps;");
-        foreach (var m in metrics)
+        foreach (string m in metrics)
             sb.AppendLine($"    public readonly byte[] Compressed{m}s;");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"    public readonly byte[] Compressed{c}s;");
         sb.AppendLine();
         sb.AppendLine("    public readonly byte[] FileHeaderBuffer;");
         sb.AppendLine();
         sb.AppendLine($"    public {structName}CompactorBuffers(int batchSize)");
         sb.AppendLine("    {");
+        sb.AppendLine("        if (batchSize <= 0) throw new ArgumentOutOfRangeException(nameof(batchSize), \"Batch size must be greater than zero.\");");
         sb.AppendLine($"        RowBuffer = new {structName}[batchSize];");
         sb.AppendLine("        Timestamps = new long[batchSize];");
-        foreach (var m in metrics)
+        foreach (string m in metrics)
             sb.AppendLine($"        {m}s = new float[batchSize];");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"        {c}s = new int[batchSize];");
         sb.AppendLine();
         sb.AppendLine("        CompressedTimestamps = new byte[batchSize * 9 + 64];");
-        foreach (var m in metrics)
+        foreach (string m in metrics)
             sb.AppendLine($"        Compressed{m}s = new byte[batchSize * 6 + 64];");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"        Compressed{c}s = new byte[batchSize * 5 + 64];");
         sb.AppendLine();
-        sb.AppendLine("        FileHeaderBuffer = new byte[64];");
+        sb.AppendLine($"        FileHeaderBuffer = new byte[{headerSize}];");
         sb.AppendLine("    }");
         sb.AppendLine("}");
         sb.AppendLine();
@@ -182,74 +160,95 @@ public class ChronoGenerator : IIncrementalGenerator
         // 2. Compactor
         sb.AppendLine($"public static class {structName}Compactor");
         sb.AppendLine("{");
-        sb.AppendLine($"    public static bool CompactBatch(");
+        sb.AppendLine("    public const uint Magic = 0x48434C47;");
+        sb.AppendLine("    public const uint FormatVersion = 2;");
+        sb.AppendLine($"    public const int HeaderSize = {headerSize};");
+        sb.AppendLine();
+        sb.AppendLine($"    private readonly struct TimestampComparer : System.Collections.Generic.IComparer<{structName}>");
+        sb.AppendLine("    {");
+        sb.AppendLine($"        public int Compare({structName} x, {structName} y) => x.{timestampField}.CompareTo(y.{timestampField});");
+        sb.AppendLine("    }");
+        sb.AppendLine();
+        sb.AppendLine("    public static bool CompactBatch(");
         sb.AppendLine($"        HotRingBuffer<{structName}> ringBuffer,");
-        sb.AppendLine($"        ref long nextSequenceToRead,");
-        sb.AppendLine($"        int batchSize,");
-        sb.AppendLine($"        string outputDirectory,");
+        sb.AppendLine("        ref long nextSequenceToRead,");
+        sb.AppendLine("        int batchSize,");
+        sb.AppendLine("        string outputDirectory,");
         sb.AppendLine($"        {structName}CompactorBuffers buffers)");
         sb.AppendLine("    {");
-        sb.AppendLine("        if (!ringBuffer.TryReadBatch(nextSequenceToRead, buffers.RowBuffer))");
+        sb.AppendLine("        ArgumentNullException.ThrowIfNull(ringBuffer);");
+        sb.AppendLine("        ArgumentNullException.ThrowIfNull(buffers);");
+        sb.AppendLine("        if (batchSize <= 0 || batchSize > buffers.RowBuffer.Length)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            throw new ArgumentOutOfRangeException(nameof(batchSize), \"Batch size must be between 1 and buffers capacity.\");");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+        sb.AppendLine($"        Span<{structName}> rowSpan = buffers.RowBuffer.AsSpan(0, batchSize);");
+        sb.AppendLine("        if (!ringBuffer.TryReadBatch(nextSequenceToRead, rowSpan))");
         sb.AppendLine("        {");
         sb.AppendLine("            return false;");
         sb.AppendLine("        }");
         sb.AppendLine();
-        sb.AppendLine("        Array.Sort(buffers.RowBuffer, 0, batchSize);");
+        sb.AppendLine("        MemoryExtensions.Sort(rowSpan, default(TimestampComparer));");
         sb.AppendLine();
         sb.AppendLine("        for (int i = 0; i < batchSize; i++)");
         sb.AppendLine("        {");
-        sb.AppendLine($"            buffers.Timestamps[i] = buffers.RowBuffer[i].{timestampField};");
-        foreach (var m in metrics)
-            sb.AppendLine($"            buffers.{m}s[i] = buffers.RowBuffer[i].{m};");
-        foreach (var c in categories)
-            sb.AppendLine($"            buffers.{c}s[i] = buffers.RowBuffer[i].{c};");
+        sb.AppendLine($"            buffers.Timestamps[i] = rowSpan[i].{timestampField};");
+        foreach (string m in metrics)
+            sb.AppendLine($"            buffers.{m}s[i] = rowSpan[i].{m};");
+        foreach (string c in categories)
+            sb.AppendLine($"            buffers.{c}s[i] = rowSpan[i].{c};");
         sb.AppendLine("        }");
         sb.AppendLine();
-        sb.AppendLine("        int tsLen = TimestampCompressor.Compress(buffers.Timestamps, buffers.CompressedTimestamps);");
-        foreach (var m in metrics)
-            sb.AppendLine($"        int {m}Len = GorillaCompressor.Compress(buffers.{m}s, buffers.Compressed{m}s);");
-        foreach (var c in categories)
-            sb.AppendLine($"        int {c}Len = IntegerRleCompressor.Compress(buffers.{c}s, buffers.Compressed{c}s);");
+        sb.AppendLine("        long minTimestamp = buffers.Timestamps[0];");
+        sb.AppendLine("        long maxTimestamp = buffers.Timestamps[batchSize - 1];");
         sb.AppendLine();
-        sb.AppendLine("        long tsOffset = 64;");
-        
+        sb.AppendLine("        int tsLen = TimestampCompressor.Compress(buffers.Timestamps.AsSpan(0, batchSize), buffers.CompressedTimestamps);");
+        foreach (string m in metrics)
+            sb.AppendLine($"        int {m}Len = GorillaCompressor.Compress(buffers.{m}s.AsSpan(0, batchSize), buffers.Compressed{m}s);");
+        foreach (string c in categories)
+            sb.AppendLine($"        int {c}Len = IntegerRleCompressor.Compress(buffers.{c}s.AsSpan(0, batchSize), buffers.Compressed{c}s);");
+        sb.AppendLine();
+        sb.AppendLine($"        long tsOffset = {headerSize};");
+
         string prevOffset = "tsOffset";
         string prevLen = "tsLen";
-        foreach (var m in metrics)
+        foreach (string m in metrics)
         {
             sb.AppendLine($"        long {m}Offset = {prevOffset} + {prevLen};");
             prevOffset = $"{m}Offset";
             prevLen = $"{m}Len";
         }
-        foreach (var c in categories)
+        foreach (string c in categories)
         {
             sb.AppendLine($"        long {c}Offset = {prevOffset} + {prevLen};");
             prevOffset = $"{c}Offset";
             prevLen = $"{c}Len";
         }
         sb.AppendLine();
-        sb.AppendLine("        Span<byte> header = buffers.FileHeaderBuffer;");
+        sb.AppendLine("        Span<byte> header = buffers.FileHeaderBuffer.AsSpan(0, HeaderSize);");
         sb.AppendLine("        header.Clear();");
-        sb.AppendLine("        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(0, 4), 0x48434C47);");
-        sb.AppendLine("        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(4, 4), 1);");
+        sb.AppendLine("        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(0, 4), Magic);");
+        sb.AppendLine("        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(4, 4), FormatVersion);");
         sb.AppendLine("        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(8, 4), batchSize);");
-        sb.AppendLine();
-        sb.AppendLine("        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(12, 8), tsOffset);");
-        sb.AppendLine("        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(20, 4), tsLen);");
+        sb.AppendLine("        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(12, 8), minTimestamp);");
+        sb.AppendLine("        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(20, 8), maxTimestamp);");
+        sb.AppendLine("        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(28, 8), tsOffset);");
+        sb.AppendLine("        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(36, 4), tsLen);");
         sb.AppendLine();
 
         int slot = 0;
-        foreach (var m in metrics)
+        foreach (string m in metrics)
         {
-            int offsetPos = 24 + slot * 12;
+            int offsetPos = 40 + slot * 12;
             int lenPos = offsetPos + 8;
             sb.AppendLine($"        BinaryPrimitives.WriteInt64LittleEndian(header.Slice({offsetPos}, 8), {m}Offset);");
             sb.AppendLine($"        BinaryPrimitives.WriteInt32LittleEndian(header.Slice({lenPos}, 4), {m}Len);");
             slot++;
         }
-        foreach (var c in categories)
+        foreach (string c in categories)
         {
-            int offsetPos = 24 + slot * 12;
+            int offsetPos = 40 + slot * 12;
             int lenPos = offsetPos + 8;
             sb.AppendLine($"        BinaryPrimitives.WriteInt64LittleEndian(header.Slice({offsetPos}, 8), {c}Offset);");
             sb.AppendLine($"        BinaryPrimitives.WriteInt32LittleEndian(header.Slice({lenPos}, 4), {c}Len);");
@@ -257,15 +256,15 @@ public class ChronoGenerator : IIncrementalGenerator
         }
         sb.AppendLine();
         sb.AppendLine("        Directory.CreateDirectory(outputDirectory);");
-        sb.AppendLine($"        string fileName = Path.Combine(outputDirectory, $\"chunk_{{nextSequenceToRead}}.glacier\");");
+        sb.AppendLine("        string fileName = Path.Combine(outputDirectory, $\"chunk_{nextSequenceToRead}.glacier\");");
         sb.AppendLine();
         sb.AppendLine("        using (var fs = new FileStream(fileName, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))");
         sb.AppendLine("        {");
         sb.AppendLine("            fs.Write(header);");
         sb.AppendLine("            fs.Write(buffers.CompressedTimestamps.AsSpan(0, tsLen));");
-        foreach (var m in metrics)
+        foreach (string m in metrics)
             sb.AppendLine($"            fs.Write(buffers.Compressed{m}s.AsSpan(0, {m}Len));");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"            fs.Write(buffers.Compressed{c}s.AsSpan(0, {c}Len));");
         sb.AppendLine("        }");
         sb.AppendLine();
@@ -278,133 +277,408 @@ public class ChronoGenerator : IIncrementalGenerator
         sb.AppendLine();
 
         // 3. QueryBuffers
-        sb.AppendLine($"public class {structName}QueryBuffers");
+        sb.AppendLine($"public sealed class {structName}QueryBuffers");
         sb.AppendLine("{");
-        foreach (var m in metrics)
+        sb.AppendLine("    public readonly long[] Timestamps;");
+        foreach (string m in metrics)
             sb.AppendLine($"    public readonly float[] {m}s;");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"    public readonly int[] {c}s;");
-        foreach (var m in metrics)
+        sb.AppendLine("    public readonly byte[] CompressedTimestampBuffer;");
+        foreach (string m in metrics)
             sb.AppendLine($"    public readonly byte[] Compressed{m}Buffer;");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"    public readonly byte[] Compressed{c}Buffer;");
         sb.AppendLine();
         sb.AppendLine($"    public {structName}QueryBuffers(int maxBatchSize)");
         sb.AppendLine("    {");
-        foreach (var m in metrics)
+        sb.AppendLine("        if (maxBatchSize <= 0) throw new ArgumentOutOfRangeException(nameof(maxBatchSize), \"Max batch size must be greater than zero.\");");
+        sb.AppendLine("        Timestamps = new long[maxBatchSize];");
+        foreach (string m in metrics)
             sb.AppendLine($"        {m}s = new float[maxBatchSize];");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"        {c}s = new int[maxBatchSize];");
-        foreach (var m in metrics)
+        sb.AppendLine("        CompressedTimestampBuffer = new byte[maxBatchSize * 9 + 64];");
+        foreach (string m in metrics)
             sb.AppendLine($"        Compressed{m}Buffer = new byte[maxBatchSize * 6 + 64];");
-        foreach (var c in categories)
+        foreach (string c in categories)
             sb.AppendLine($"        Compressed{c}Buffer = new byte[maxBatchSize * 5 + 64];");
         sb.AppendLine("    }");
         sb.AppendLine("}");
         sb.AppendLine();
 
-        // 4. QueryEngine with specialized methods
+        // 4. QueryEngine
         sb.AppendLine($"public static class {structName}QueryEngine");
         sb.AppendLine("{");
-        foreach (var m in metrics)
+        sb.AppendLine($"    public const int HeaderSize = {headerSize};");
+        sb.AppendLine();
+        sb.AppendLine("    public static (int RowCount, long MinTimestamp, long MaxTimestamp) ReadChunkZoneMap(string chunkFilePath)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        using SafeFileHandle handle = File.OpenHandle(chunkFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);");
+        sb.AppendLine("        Span<byte> header = stackalloc byte[HeaderSize];");
+        sb.AppendLine("        ValidateAndReadHeader(handle, header, out int rowCount, out long minTimestamp, out long maxTimestamp);");
+        sb.AppendLine("        return (rowCount, minTimestamp, maxTimestamp);");
+        sb.AppendLine("    }");
+
+        for (int mIdx = 0; mIdx < metrics.Length; mIdx++)
         {
-            foreach (var c in categories)
+            string m = metrics[mIdx];
+            int mOffsetPos = 40 + mIdx * 12;
+
+            // Unfiltered methods (supports 0-category tables as well as multi-category tables)
+            sb.AppendLine();
+            sb.AppendLine($"    public static double GetAverage{m}(string chunkFilePath, {structName}QueryBuffers buffers)");
+            sb.AppendLine("    {");
+            sb.AppendLine($"        return GetAverage{m}(chunkFilePath, long.MinValue, long.MaxValue, buffers);");
+            sb.AppendLine("    }");
+
+            sb.AppendLine();
+            sb.AppendLine($"    public static double GetAverage{m}(string chunkFilePath, long startTimestamp, long endTimestamp, {structName}QueryBuffers buffers)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        ArgumentNullException.ThrowIfNull(buffers);");
+            sb.AppendLine($"        var (sum, count) = ScanChunkUnfiltered(chunkFilePath, {mOffsetPos}, buffers.{m}s, buffers.Compressed{m}Buffer, buffers, startTimestamp, endTimestamp);");
+            sb.AppendLine("        return count == 0 ? 0.0 : sum / count;");
+            sb.AppendLine("    }");
+
+            sb.AppendLine();
+            sb.AppendLine($"    public static double GetAverage{m}InDirectory(string chunksDirectory, long startTimestamp, long endTimestamp, {structName}QueryBuffers buffers)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        ArgumentNullException.ThrowIfNull(buffers);");
+            sb.AppendLine("        double totalSum = 0.0;");
+            sb.AppendLine("        long totalCount = 0;");
+            sb.AppendLine("        foreach (string chunkFile in Directory.EnumerateFiles(chunksDirectory, \"*.glacier\"))");
+            sb.AppendLine("        {");
+            sb.AppendLine($"            var (sum, count) = ScanChunkUnfiltered(chunkFile, {mOffsetPos}, buffers.{m}s, buffers.Compressed{m}Buffer, buffers, startTimestamp, endTimestamp);");
+            sb.AppendLine("            totalSum += sum;");
+            sb.AppendLine("            totalCount += count;");
+            sb.AppendLine("        }");
+            sb.AppendLine("        return totalCount == 0 ? 0.0 : totalSum / totalCount;");
+            sb.AppendLine("    }");
+
+            // Category-filtered methods
+            for (int cIdx = 0; cIdx < categories.Length; cIdx++)
             {
+                string c = categories[cIdx];
+                int cOffsetPos = 40 + (metrics.Length + cIdx) * 12;
+
+                sb.AppendLine();
                 sb.AppendLine($"    public static double GetAverage{m}For{c}(string chunkFilePath, int target{c}, {structName}QueryBuffers buffers)");
                 sb.AppendLine("    {");
-                sb.AppendLine("        using (var mmf = MemoryMappedFile.CreateFromFile(chunkFilePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read))");
-                sb.AppendLine("        {");
-                sb.AppendLine("            int rowCount;");
-                sb.AppendLine($"            long {m}Offset, {c}Offset;");
-                sb.AppendLine($"            int {m}Len, {c}Len;");
-                sb.AppendLine();
-                sb.AppendLine("            using (var accessor = mmf.CreateViewAccessor(0, 64, MemoryMappedFileAccess.Read))");
-                sb.AppendLine("            {");
-                sb.AppendLine("                byte[] header = new byte[64];");
-                sb.AppendLine("                accessor.ReadArray(0, header, 0, 64);");
-                sb.AppendLine("                uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));");
-                sb.AppendLine("                if (magic != 0x48434C47) throw new InvalidDataException(\"Magic mismatch.\");");
-                sb.AppendLine("                rowCount = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));");
-                sb.AppendLine();
-                
-                int mIndex = metrics.IndexOf(m);
-                int cIndex = categories.IndexOf(c) + metrics.Count;
-                int mOffsetPos = 24 + mIndex * 12;
-                int mLenPos = mOffsetPos + 8;
-                int cOffsetPos = 24 + cIndex * 12;
-                int cLenPos = cOffsetPos + 8;
+                sb.AppendLine($"        return GetAverage{m}For{c}(chunkFilePath, target{c}, long.MinValue, long.MaxValue, buffers);");
+                sb.AppendLine("    }");
 
-                sb.AppendLine($"                {m}Offset = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan({mOffsetPos}, 8));");
-                sb.AppendLine($"                {m}Len = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan({mLenPos}, 4));");
-                sb.AppendLine($"                {c}Offset = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan({cOffsetPos}, 8));");
-                sb.AppendLine($"                {c}Len = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan({cLenPos}, 4));");
-                sb.AppendLine("            }");
                 sb.AppendLine();
-                sb.AppendLine("            if (rowCount <= 0) return 0.0;");
+                sb.AppendLine($"    public static double GetAverage{m}For{c}(string chunkFilePath, int target{c}, long startTimestamp, long endTimestamp, {structName}QueryBuffers buffers)");
+                sb.AppendLine("    {");
+                sb.AppendLine("        ArgumentNullException.ThrowIfNull(buffers);");
+                sb.AppendLine($"        var (sum, count) = ScanChunkFiltered(chunkFilePath, {mOffsetPos}, buffers.{m}s, buffers.Compressed{m}Buffer, {cOffsetPos}, buffers.{c}s, buffers.Compressed{c}Buffer, target{c}, buffers, startTimestamp, endTimestamp);");
+                sb.AppendLine("        return count == 0 ? 0.0 : sum / count;");
+                sb.AppendLine("    }");
+
                 sb.AppendLine();
-                sb.AppendLine($"            using (var metricAccessor = mmf.CreateViewAccessor({m}Offset, {m}Len, MemoryMappedFileAccess.Read))");
-                sb.AppendLine("            {");
-                sb.AppendLine($"                metricAccessor.ReadArray(0, buffers.Compressed{m}Buffer, 0, {m}Len);");
-                sb.AppendLine("            }");
-                sb.AppendLine();
-                sb.AppendLine($"            using (var catAccessor = mmf.CreateViewAccessor({c}Offset, {c}Len, MemoryMappedFileAccess.Read))");
-                sb.AppendLine("            {");
-                sb.AppendLine($"                catAccessor.ReadArray(0, buffers.Compressed{c}Buffer, 0, {c}Len);");
-                sb.AppendLine("            }");
-                sb.AppendLine();
-                sb.AppendLine($"            Span<float> metricSpan = buffers.{m}s.AsSpan(0, rowCount);");
-                sb.AppendLine($"            Span<int> catSpan = buffers.{c}s.AsSpan(0, rowCount);");
-                sb.AppendLine();
-                sb.AppendLine($"            GorillaCompressor.Decompress(buffers.Compressed{m}Buffer.AsSpan(0, {m}Len), metricSpan);");
-                sb.AppendLine($"            IntegerRleCompressor.Decompress(buffers.Compressed{c}Buffer.AsSpan(0, {c}Len), catSpan);");
-                sb.AppendLine();
-                sb.AppendLine("            double sum = 0.0;");
-                sb.AppendLine("            int count = 0;");
-                sb.AppendLine("            int simdLength = Vector<float>.Count;");
-                sb.AppendLine("            int i = 0;");
-                sb.AppendLine();
-                sb.AppendLine("            if (Vector.IsHardwareAccelerated && rowCount >= simdLength)");
-                sb.AppendLine("            {");
-                sb.AppendLine($"                var targetVec = new Vector<int>(target{c});");
-                sb.AppendLine("                var zeroVec = Vector<float>.Zero;");
-                sb.AppendLine("                var oneIntVec = Vector<int>.One;");
-                sb.AppendLine("                var zeroIntVec = Vector<int>.Zero;");
-                sb.AppendLine("                var sumAccumulator = Vector<float>.Zero;");
-                sb.AppendLine("                var countAccumulator = Vector<int>.Zero;");
-                sb.AppendLine();
-                sb.AppendLine("                for (; i <= rowCount - simdLength; i += simdLength)");
-                sb.AppendLine("                {");
-                sb.AppendLine("                    var catVec = new Vector<int>(catSpan.Slice(i, simdLength));");
-                sb.AppendLine("                    var metricVec = new Vector<float>(metricSpan.Slice(i, simdLength));");
-                sb.AppendLine("                    Vector<int> maskInt = Vector.Equals(catVec, targetVec);");
-                sb.AppendLine("                    Vector<float> maskFloat = Vector.AsVectorSingle(maskInt);");
-                sb.AppendLine("                    sumAccumulator += Vector.ConditionalSelect(maskFloat, metricVec, zeroVec);");
-                sb.AppendLine("                    countAccumulator += Vector.ConditionalSelect(maskInt, oneIntVec, zeroIntVec);");
-                sb.AppendLine("                }");
-                sb.AppendLine();
-                sb.AppendLine("                for (int j = 0; j < simdLength; j++)");
-                sb.AppendLine("                {");
-                sb.AppendLine("                    sum += sumAccumulator[j];");
-                sb.AppendLine("                    count += countAccumulator[j];");
-                sb.AppendLine("                }");
-                sb.AppendLine("            }");
-                sb.AppendLine();
-                sb.AppendLine("            for (; i < rowCount; i++)");
-                sb.AppendLine("            {");
-                sb.AppendLine($"                if (catSpan[i] == target{c})");
-                sb.AppendLine("                {");
-                sb.AppendLine("                    sum += metricSpan[i];");
-                sb.AppendLine("                    count++;");
-                sb.AppendLine("                }");
-                sb.AppendLine("            }");
-                sb.AppendLine();
-                sb.AppendLine("            return count == 0 ? 0.0 : sum / count;");
+                sb.AppendLine($"    public static double GetAverage{m}For{c}InDirectory(string chunksDirectory, int target{c}, long startTimestamp, long endTimestamp, {structName}QueryBuffers buffers)");
+                sb.AppendLine("    {");
+                sb.AppendLine("        ArgumentNullException.ThrowIfNull(buffers);");
+                sb.AppendLine("        double totalSum = 0.0;");
+                sb.AppendLine("        long totalCount = 0;");
+                sb.AppendLine("        foreach (string chunkFile in Directory.EnumerateFiles(chunksDirectory, \"*.glacier\"))");
+                sb.AppendLine("        {");
+                sb.AppendLine($"            var (sum, count) = ScanChunkFiltered(chunkFile, {mOffsetPos}, buffers.{m}s, buffers.Compressed{m}Buffer, {cOffsetPos}, buffers.{c}s, buffers.Compressed{c}Buffer, target{c}, buffers, startTimestamp, endTimestamp);");
+                sb.AppendLine("            totalSum += sum;");
+                sb.AppendLine("            totalCount += count;");
                 sb.AppendLine("        }");
+                sb.AppendLine("        return totalCount == 0 ? 0.0 : totalSum / totalCount;");
                 sb.AppendLine("    }");
             }
         }
+
+        // Emit ValidateAndReadHeader
+        sb.AppendLine();
+        sb.AppendLine("    private static void ValidateAndReadHeader(SafeFileHandle handle, Span<byte> header, out int rowCount, out long minTimestamp, out long maxTimestamp)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        int bytesRead = RandomAccess.Read(handle, header, 0);");
+        sb.AppendLine("        if (bytesRead < 12) throw new InvalidDataException(\"Invalid file format: Truncated header.\");");
+        sb.AppendLine("        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0, 4));");
+        sb.AppendLine($"        if (magic != {structName}Compactor.Magic) throw new InvalidDataException(\"Invalid file format: Magic bytes mismatch.\");");
+        sb.AppendLine("        uint version = BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(4, 4));");
+        sb.AppendLine($"        if (version != {structName}Compactor.FormatVersion || bytesRead < HeaderSize) throw new InvalidDataException($\"Unsupported or truncated .glacier header version: {{version}}.\");");
+        sb.AppendLine("        rowCount = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(8, 4));");
+        sb.AppendLine("        minTimestamp = BinaryPrimitives.ReadInt64LittleEndian(header.Slice(12, 8));");
+        sb.AppendLine("        maxTimestamp = BinaryPrimitives.ReadInt64LittleEndian(header.Slice(20, 8));");
+        sb.AppendLine("    }");
+
+        if (metrics.Length > 0)
+        {
+            // ScanChunkUnfiltered
+            sb.AppendLine();
+            sb.AppendLine("    private static (double Sum, long Count) ScanChunkUnfiltered(");
+            sb.AppendLine("        string chunkFilePath,");
+            sb.AppendLine("        int metricDescriptorPos,");
+            sb.AppendLine("        float[] metricArray,");
+            sb.AppendLine("        byte[] compressedMetricBuffer,");
+            sb.AppendLine($"        {structName}QueryBuffers buffers,");
+            sb.AppendLine("        long startTimestamp,");
+            sb.AppendLine("        long endTimestamp)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        using SafeFileHandle handle = File.OpenHandle(chunkFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);");
+            sb.AppendLine("        Span<byte> header = stackalloc byte[HeaderSize];");
+            sb.AppendLine("        ValidateAndReadHeader(handle, header, out int rowCount, out long minTimestamp, out long maxTimestamp);");
+            sb.AppendLine("        if (rowCount <= 0 || startTimestamp > endTimestamp) return (0.0, 0);");
+            sb.AppendLine("        if (maxTimestamp < startTimestamp || minTimestamp > endTimestamp) return (0.0, 0);");
+            sb.AppendLine("        if (rowCount > metricArray.Length || rowCount > buffers.Timestamps.Length)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            throw new ArgumentException(\"Buffers size is smaller than the row count in chunk file.\", nameof(buffers));");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+            sb.AppendLine("        long tsOffset = BinaryPrimitives.ReadInt64LittleEndian(header.Slice(28, 8));");
+            sb.AppendLine("        int tsLen = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(36, 4));");
+            sb.AppendLine("        long metricOffset = BinaryPrimitives.ReadInt64LittleEndian(header.Slice(metricDescriptorPos, 8));");
+            sb.AppendLine("        int metricLen = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(metricDescriptorPos + 8, 4));");
+            sb.AppendLine();
+            sb.AppendLine("        using var mmf = MemoryMappedFile.CreateFromFile(handle, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);");
+            sb.AppendLine("        int startIndex = 0;");
+            sb.AppendLine("        int endIndex = rowCount;");
+            sb.AppendLine("        if (!(minTimestamp >= startTimestamp && maxTimestamp <= endTimestamp))");
+            sb.AppendLine("        {");
+            sb.AppendLine("            if ((uint)tsLen > (uint)buffers.CompressedTimestampBuffer.Length) throw new InvalidDataException(\"Invalid compressed timestamp length.\");");
+            sb.AppendLine("            using (var tsAccessor = mmf.CreateViewAccessor(tsOffset, tsLen, MemoryMappedFileAccess.Read))");
+            sb.AppendLine("            {");
+            sb.AppendLine("                tsAccessor.ReadArray(0, buffers.CompressedTimestampBuffer, 0, tsLen);");
+            sb.AppendLine("            }");
+            sb.AppendLine("            Span<long> timestamps = buffers.Timestamps.AsSpan(0, rowCount);");
+            sb.AppendLine("            TimestampCompressor.Decompress(buffers.CompressedTimestampBuffer.AsSpan(0, tsLen), timestamps);");
+            sb.AppendLine("            startIndex = LowerBound(timestamps, startTimestamp);");
+            sb.AppendLine("            endIndex = UpperBound(timestamps, endTimestamp);");
+            sb.AppendLine("            if (endIndex <= startIndex) return (0.0, 0);");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+            sb.AppendLine("        if ((uint)metricLen > (uint)compressedMetricBuffer.Length) throw new InvalidDataException(\"Invalid compressed metric length.\");");
+            sb.AppendLine("        using (var metricAccessor = mmf.CreateViewAccessor(metricOffset, metricLen, MemoryMappedFileAccess.Read))");
+            sb.AppendLine("        {");
+            sb.AppendLine("            metricAccessor.ReadArray(0, compressedMetricBuffer, 0, metricLen);");
+            sb.AppendLine("        }");
+            sb.AppendLine("        Span<float> metricSpan = metricArray.AsSpan(0, rowCount);");
+            sb.AppendLine("        GorillaCompressor.Decompress(compressedMetricBuffer.AsSpan(0, metricLen), metricSpan);");
+            sb.AppendLine("        return AggregateUnfilteredSimd(metricSpan.Slice(startIndex, endIndex - startIndex));");
+            sb.AppendLine("    }");
+
+            sb.AppendLine();
+            sb.AppendLine("    private static (double Sum, long Count) AggregateUnfilteredSimd(ReadOnlySpan<float> metricSlice)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        int len = metricSlice.Length;");
+            sb.AppendLine("        if (len == 0) return (0.0, 0);");
+            sb.AppendLine("        double sum = 0.0;");
+            sb.AppendLine("        int simdLength = Vector<float>.Count;");
+            sb.AppendLine("        int i = 0;");
+            sb.AppendLine("        if (Vector.IsHardwareAccelerated && len >= simdLength)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            var sumLow = Vector<double>.Zero;");
+            sb.AppendLine("            var sumHigh = Vector<double>.Zero;");
+            sb.AppendLine("            for (; i <= len - simdLength; i += simdLength)");
+            sb.AppendLine("            {");
+            sb.AppendLine("                var metricVec = new Vector<float>(metricSlice.Slice(i, simdLength));");
+            sb.AppendLine("                Vector.Widen(metricVec, out Vector<double> low, out Vector<double> high);");
+            sb.AppendLine("                sumLow += low;");
+            sb.AppendLine("                sumHigh += high;");
+            sb.AppendLine("            }");
+            sb.AppendLine("            sum += Vector.Sum(sumLow) + Vector.Sum(sumHigh);");
+            sb.AppendLine("        }");
+            sb.AppendLine("        for (; i < len; i++) sum += metricSlice[i];");
+            sb.AppendLine("        return (sum, len);");
+            sb.AppendLine("    }");
+
+            if (categories.Length > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("    private static (double Sum, long Count) ScanChunkFiltered(");
+                sb.AppendLine("        string chunkFilePath,");
+                sb.AppendLine("        int metricDescriptorPos,");
+                sb.AppendLine("        float[] metricArray,");
+                sb.AppendLine("        byte[] compressedMetricBuffer,");
+                sb.AppendLine("        int catDescriptorPos,");
+                sb.AppendLine("        int[] catArray,");
+                sb.AppendLine("        byte[] compressedCatBuffer,");
+                sb.AppendLine("        int targetCategory,");
+                sb.AppendLine($"        {structName}QueryBuffers buffers,");
+                sb.AppendLine("        long startTimestamp,");
+                sb.AppendLine("        long endTimestamp)");
+                sb.AppendLine("    {");
+                sb.AppendLine("        using SafeFileHandle handle = File.OpenHandle(chunkFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);");
+                sb.AppendLine("        Span<byte> header = stackalloc byte[HeaderSize];");
+                sb.AppendLine("        ValidateAndReadHeader(handle, header, out int rowCount, out long minTimestamp, out long maxTimestamp);");
+                sb.AppendLine("        if (rowCount <= 0 || startTimestamp > endTimestamp) return (0.0, 0);");
+                sb.AppendLine("        if (maxTimestamp < startTimestamp || minTimestamp > endTimestamp) return (0.0, 0);");
+                sb.AppendLine("        if (rowCount > metricArray.Length || rowCount > catArray.Length || rowCount > buffers.Timestamps.Length)");
+                sb.AppendLine("        {");
+                sb.AppendLine("            throw new ArgumentException(\"Buffers size is smaller than the row count in chunk file.\", nameof(buffers));");
+                sb.AppendLine("        }");
+                sb.AppendLine();
+                sb.AppendLine("        long tsOffset = BinaryPrimitives.ReadInt64LittleEndian(header.Slice(28, 8));");
+                sb.AppendLine("        int tsLen = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(36, 4));");
+                sb.AppendLine("        long metricOffset = BinaryPrimitives.ReadInt64LittleEndian(header.Slice(metricDescriptorPos, 8));");
+                sb.AppendLine("        int metricLen = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(metricDescriptorPos + 8, 4));");
+                sb.AppendLine("        long catOffset = BinaryPrimitives.ReadInt64LittleEndian(header.Slice(catDescriptorPos, 8));");
+                sb.AppendLine("        int catLen = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(catDescriptorPos + 8, 4));");
+                sb.AppendLine();
+                sb.AppendLine("        using var mmf = MemoryMappedFile.CreateFromFile(handle, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);");
+                sb.AppendLine("        int startIndex = 0;");
+                sb.AppendLine("        int endIndex = rowCount;");
+                sb.AppendLine("        if (!(minTimestamp >= startTimestamp && maxTimestamp <= endTimestamp))");
+                sb.AppendLine("        {");
+                sb.AppendLine("            if ((uint)tsLen > (uint)buffers.CompressedTimestampBuffer.Length) throw new InvalidDataException(\"Invalid compressed timestamp length.\");");
+                sb.AppendLine("            using (var tsAccessor = mmf.CreateViewAccessor(tsOffset, tsLen, MemoryMappedFileAccess.Read))");
+                sb.AppendLine("            {");
+                sb.AppendLine("                tsAccessor.ReadArray(0, buffers.CompressedTimestampBuffer, 0, tsLen);");
+                sb.AppendLine("            }");
+                sb.AppendLine("            Span<long> timestamps = buffers.Timestamps.AsSpan(0, rowCount);");
+                sb.AppendLine("            TimestampCompressor.Decompress(buffers.CompressedTimestampBuffer.AsSpan(0, tsLen), timestamps);");
+                sb.AppendLine("            startIndex = LowerBound(timestamps, startTimestamp);");
+                sb.AppendLine("            endIndex = UpperBound(timestamps, endTimestamp);");
+                sb.AppendLine("            if (endIndex <= startIndex) return (0.0, 0);");
+                sb.AppendLine("        }");
+                sb.AppendLine();
+                sb.AppendLine("        if ((uint)metricLen > (uint)compressedMetricBuffer.Length) throw new InvalidDataException(\"Invalid compressed metric length.\");");
+                sb.AppendLine("        using (var metricAccessor = mmf.CreateViewAccessor(metricOffset, metricLen, MemoryMappedFileAccess.Read))");
+                sb.AppendLine("        {");
+                sb.AppendLine("            metricAccessor.ReadArray(0, compressedMetricBuffer, 0, metricLen);");
+                sb.AppendLine("        }");
+                sb.AppendLine("        if ((uint)catLen > (uint)compressedCatBuffer.Length) throw new InvalidDataException(\"Invalid compressed category length.\");");
+                sb.AppendLine("        using (var catAccessor = mmf.CreateViewAccessor(catOffset, catLen, MemoryMappedFileAccess.Read))");
+                sb.AppendLine("        {");
+                sb.AppendLine("            catAccessor.ReadArray(0, compressedCatBuffer, 0, catLen);");
+                sb.AppendLine("        }");
+                sb.AppendLine();
+                sb.AppendLine("        Span<float> metricSpan = metricArray.AsSpan(0, rowCount);");
+                sb.AppendLine("        Span<int> catSpan = catArray.AsSpan(0, rowCount);");
+                sb.AppendLine("        GorillaCompressor.Decompress(compressedMetricBuffer.AsSpan(0, metricLen), metricSpan);");
+                sb.AppendLine("        IntegerRleCompressor.Decompress(compressedCatBuffer.AsSpan(0, catLen), catSpan);");
+                sb.AppendLine();
+                sb.AppendLine("        int sliceLen = endIndex - startIndex;");
+                sb.AppendLine("        return AggregateFilteredSimd(metricSpan.Slice(startIndex, sliceLen), catSpan.Slice(startIndex, sliceLen), targetCategory);");
+                sb.AppendLine("    }");
+
+                sb.AppendLine();
+                sb.AppendLine("    private static (double Sum, long Count) AggregateFilteredSimd(ReadOnlySpan<float> metricSlice, ReadOnlySpan<int> catSlice, int targetCategory)");
+                sb.AppendLine("    {");
+                sb.AppendLine("        int len = metricSlice.Length;");
+                sb.AppendLine("        if (len == 0) return (0.0, 0);");
+                sb.AppendLine("        double sum = 0.0;");
+                sb.AppendLine("        long count = 0;");
+                sb.AppendLine("        int simdLength = Vector<float>.Count;");
+                sb.AppendLine("        int i = 0;");
+                sb.AppendLine("        if (Vector.IsHardwareAccelerated && len >= simdLength)");
+                sb.AppendLine("        {");
+                sb.AppendLine("            var targetVec = new Vector<int>(targetCategory);");
+                sb.AppendLine("            var zeroVec = Vector<float>.Zero;");
+                sb.AppendLine("            var oneIntVec = Vector<int>.One;");
+                sb.AppendLine("            var zeroIntVec = Vector<int>.Zero;");
+                sb.AppendLine("            var sumLow = Vector<double>.Zero;");
+                sb.AppendLine("            var sumHigh = Vector<double>.Zero;");
+                sb.AppendLine("            var countAccumulator = Vector<int>.Zero;");
+                sb.AppendLine("            for (; i <= len - simdLength; i += simdLength)");
+                sb.AppendLine("            {");
+                sb.AppendLine("                var catVec = new Vector<int>(catSlice.Slice(i, simdLength));");
+                sb.AppendLine("                var metricVec = new Vector<float>(metricSlice.Slice(i, simdLength));");
+                sb.AppendLine("                Vector<int> maskInt = Vector.Equals(catVec, targetVec);");
+                sb.AppendLine("                Vector<float> maskFloat = Vector.AsVectorSingle(maskInt);");
+                sb.AppendLine("                Vector<float> selectedMetric = Vector.ConditionalSelect(maskFloat, metricVec, zeroVec);");
+                sb.AppendLine("                Vector.Widen(selectedMetric, out Vector<double> low, out Vector<double> high);");
+                sb.AppendLine("                sumLow += low;");
+                sb.AppendLine("                sumHigh += high;");
+                sb.AppendLine("                countAccumulator += Vector.ConditionalSelect(maskInt, oneIntVec, zeroIntVec);");
+                sb.AppendLine("            }");
+                sb.AppendLine("            sum += Vector.Sum(sumLow) + Vector.Sum(sumHigh);");
+                sb.AppendLine("            count += Vector.Sum(countAccumulator);");
+                sb.AppendLine("        }");
+                sb.AppendLine("        for (; i < len; i++)");
+                sb.AppendLine("        {");
+                sb.AppendLine("            if (catSlice[i] == targetCategory)");
+                sb.AppendLine("            {");
+                sb.AppendLine("                sum += metricSlice[i];");
+                sb.AppendLine("                count++;");
+                sb.AppendLine("            }");
+                sb.AppendLine("        }");
+                sb.AppendLine("        return (sum, count);");
+                sb.AppendLine("    }");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("    private static int LowerBound(ReadOnlySpan<long> span, long value)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        int lo = 0, hi = span.Length;");
+            sb.AppendLine("        while (lo < hi)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            int mid = lo + ((hi - lo) >> 1);");
+            sb.AppendLine("            if (span[mid] < value) lo = mid + 1; else hi = mid;");
+            sb.AppendLine("        }");
+            sb.AppendLine("        return lo;");
+            sb.AppendLine("    }");
+            sb.AppendLine();
+            sb.AppendLine("    private static int UpperBound(ReadOnlySpan<long> span, long value)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        int lo = 0, hi = span.Length;");
+            sb.AppendLine("        while (lo < hi)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            int mid = lo + ((hi - lo) >> 1);");
+            sb.AppendLine("            if (span[mid] <= value) lo = mid + 1; else hi = mid;");
+            sb.AppendLine("        }");
+            sb.AppendLine("        return lo;");
+            sb.AppendLine("    }");
+        }
+
         sb.AppendLine("}");
 
         context.AddSource($"{structName}_Generated.g.cs", SourceText.From(sb.ToString(), Encoding.UTF8));
+    }
+
+    private sealed class ChronoTableModel : IEquatable<ChronoTableModel>
+    {
+        public string StructName { get; }
+        public string Namespace { get; }
+        public string TimestampField { get; }
+        public ImmutableArray<string> Metrics { get; }
+        public ImmutableArray<string> Categories { get; }
+
+        public ChronoTableModel(
+            string structName,
+            string ns,
+            string timestampField,
+            ImmutableArray<string> metrics,
+            ImmutableArray<string> categories)
+        {
+            StructName = structName;
+            Namespace = ns;
+            TimestampField = timestampField;
+            Metrics = metrics;
+            Categories = categories;
+        }
+
+        public bool Equals(ChronoTableModel? other)
+        {
+            if (other is null) return false;
+            if (ReferenceEquals(this, other)) return true;
+
+            return StructName == other.StructName &&
+                   Namespace == other.Namespace &&
+                   TimestampField == other.TimestampField &&
+                   Metrics.SequenceEqual(other.Metrics) &&
+                   Categories.SequenceEqual(other.Categories);
+        }
+
+        public override bool Equals(object? obj) => Equals(obj as ChronoTableModel);
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int hash = 17;
+                hash = hash * 31 + StructName.GetHashCode();
+                hash = hash * 31 + Namespace.GetHashCode();
+                hash = hash * 31 + TimestampField.GetHashCode();
+                foreach (string m in Metrics) hash = hash * 31 + m.GetHashCode();
+                foreach (string c in Categories) hash = hash * 31 + c.GetHashCode();
+                return hash;
+            }
+        }
     }
 }

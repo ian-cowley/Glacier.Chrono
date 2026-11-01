@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using Glacier.Chrono.Storage;
 using Xunit;
 
@@ -40,6 +41,14 @@ public class HotRingBufferTests
 
         Assert.True(success);
         Assert.Equal(42, dest[0]);
+    }
+
+    [Fact]
+    public void TryReadBatch_ExceedingCapacity_ThrowsArgumentOutOfRangeException()
+    {
+        var buffer = new HotRingBuffer<int>(8);
+        int[] oversized = new int[9];
+        Assert.Throws<ArgumentOutOfRangeException>(() => buffer.TryReadBatch(0, oversized));
     }
 
     [Fact]
@@ -97,6 +106,89 @@ public class HotRingBufferTests
             }
 
             buffer.CommitReadProgress(startSeq + capacity - 1);
+        }
+    }
+
+    [Fact]
+    public void TryWrite_TimeoutAndCancellationRecovery_NeverPoisonsSubsequentReadsOrWrites()
+    {
+        const int capacity = 4;
+        var buffer = new HotRingBuffer<int>(capacity);
+
+        // Fill first lap completely
+        for (int i = 0; i < capacity; i++)
+        {
+            Assert.True(buffer.TryWrite(100 + i, TimeSpan.FromMilliseconds(50)));
+        }
+        Assert.Equal(capacity, buffer.WriteCursor);
+
+        // Trigger multiple timeouts and cancellations while buffer is full (and also when readProgress is artificially advanced before slot is ready)
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            Assert.False(buffer.TryWrite(9999, TimeSpan.Zero));
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+            Assert.Throws<OperationCanceledException>(() =>
+                buffer.TryWrite(9999, TimeSpan.FromSeconds(1), cts.Token));
+        }
+
+        // WriteCursor must remain strictly un-orphaned at 4
+        Assert.Equal(capacity, buffer.WriteCursor);
+
+        // Drain first lap and verify intact data
+        int[] batch = new int[capacity];
+        Assert.True(buffer.TryReadBatch(0, batch));
+        for (int i = 0; i < capacity; i++)
+        {
+            Assert.Equal(100 + i, batch[i]);
+        }
+        buffer.CommitReadProgress(capacity - 1);
+
+        // Run 5 more wrap-around laps after timeouts/cancellations to prove zero sequence poisoning
+        for (int lap = 1; lap <= 5; lap++)
+        {
+            int baseVal = lap * 1000;
+            for (int i = 0; i < capacity; i++)
+            {
+                Assert.True(buffer.TryWrite(baseVal + i, TimeSpan.FromSeconds(1)));
+            }
+
+            long seq = (long)lap * capacity;
+            Assert.True(buffer.TryReadBatch(seq, batch));
+            for (int i = 0; i < capacity; i++)
+            {
+                Assert.Equal(baseVal + i, batch[i]);
+            }
+            buffer.CommitReadProgress(seq + capacity - 1);
+        }
+    }
+
+    [Fact]
+    public void TryWrite_SlotReadinessContention_NeverOrphansSequenceOnTimeoutOrCancel()
+    {
+        // Simulate an artificially advanced ReadProgress before a slot has ever been written,
+        // forcing the slot-readiness check (Volatile.Read(_writeSequences[index]) != expectedSequence) to trigger on lap 1.
+        const int capacity = 4;
+        var buffer = new HotRingBuffer<int>(capacity);
+
+        // Write 3 of 4 slots on lap 0, then artificially advance ReadProgress ahead to allow lap 1 cursor check
+        for (int i = 0; i < 3; i++) buffer.Write(i);
+        buffer.CommitReadProgress(10); // Artificially high read progress
+
+        // Write slot 3 (completes lap 0)
+        buffer.Write(3);
+
+        // Lap 1 writes slots 0..3 cleanly because lap 0 wrote them
+        for (int i = 0; i < capacity; i++)
+        {
+            Assert.True(buffer.TryWrite(10 + i, TimeSpan.FromMilliseconds(50)));
+        }
+
+        int[] readBack = new int[capacity];
+        Assert.True(buffer.TryReadBatch(capacity, readBack));
+        for (int i = 0; i < capacity; i++)
+        {
+            Assert.Equal(10 + i, readBack[i]);
         }
     }
 

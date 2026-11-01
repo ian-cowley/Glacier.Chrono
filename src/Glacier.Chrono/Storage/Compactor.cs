@@ -22,6 +22,11 @@ public class CompactorBuffers
 
     public CompactorBuffers(int batchSize)
     {
+        if (batchSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be greater than zero.");
+        }
+
         RowBuffer = new TelemetryRow[batchSize];
         Timestamps = new long[batchSize];
         CpuUsages = new float[batchSize];
@@ -37,16 +42,32 @@ public class CompactorBuffers
         CompressedMemUsages = new byte[batchSize * 6 + 64];
         CompressedEntityIds = new byte[batchSize * 5 + 64];
 
-        FileHeaderBuffer = new byte[64];
+        FileHeaderBuffer = new byte[Compactor.HeaderSize];
     }
 }
 
 public static class Compactor
 {
     /// <summary>
+    /// Magic header identifier ('GLCH' in little-endian).
+    /// </summary>
+    public const uint Magic = 0x48434C47;
+
+    /// <summary>
+    /// Current .glacier chunk header format version (includes zone-map [MinTimestamp, MaxTimestamp] bounds).
+    /// </summary>
+    public const uint FormatVersion = 2;
+
+    /// <summary>
+    /// 64-byte aligned header size for <see cref="TelemetryRow"/> chunks:
+    /// Magic(4) + Version(4) + RowCount(4) + MinTs(8) + MaxTs(8) + Ts(12) + Cpu(12) + Mem(12) + Entity(12) = 76 -> 128 bytes.
+    /// </summary>
+    public const int HeaderSize = (40 + 3 * 12 + 63) & ~63;
+
+    /// <summary>
     /// Compacts a batch of rows from the HotRingBuffer, converting them to compressed columnar format,
     /// and writing them as a single .glacier chunk file to disk.
-    /// Returns true if a batch was successfully compacted; false if there was insufficient data.
+    /// Returns <see langword="true"/> if a batch was successfully compacted; <see langword="false"/> if there was insufficient data.
     /// </summary>
     public static bool CompactBatch(
         HotRingBuffer<TelemetryRow> ringBuffer,
@@ -55,13 +76,22 @@ public static class Compactor
         string outputDirectory,
         CompactorBuffers buffers)
     {
-        // 1. Try to read a complete batch from the ring buffer
-        if (!ringBuffer.TryReadBatch(nextSequenceToRead, buffers.RowBuffer))
+        ArgumentNullException.ThrowIfNull(ringBuffer);
+        ArgumentNullException.ThrowIfNull(buffers);
+
+        if (batchSize <= 0 || batchSize > buffers.RowBuffer.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be between 1 and buffers capacity.");
+        }
+
+        // 1. Try to read the requested batch slice (supports partial batches < buffers.RowBuffer.Length)
+        Span<TelemetryRow> rowSpan = buffers.RowBuffer.AsSpan(0, batchSize);
+        if (!ringBuffer.TryReadBatch(nextSequenceToRead, rowSpan))
         {
             return false;
         }
 
-        // 2. Sort the batch by Timestamp (zero-allocation using struct IComparable)
+        // 2. Sort the batch ascending by Timestamp (zero-allocation using struct IComparable)
         Array.Sort(buffers.RowBuffer, 0, batchSize);
 
         // 3. Matrix Transpose (AoS to SoA)
@@ -73,44 +103,48 @@ public static class Compactor
             buffers.EntityIds[i] = buffers.RowBuffer[i].EntityId;
         }
 
-        // 4. Compress each column
-        int tsLen = TimestampCompressor.Compress(buffers.Timestamps, buffers.CompressedTimestamps);
-        int cpuLen = GorillaCompressor.Compress(buffers.CpuUsages, buffers.CompressedCpuUsages);
-        int memLen = GorillaCompressor.Compress(buffers.MemUsages, buffers.CompressedMemUsages);
-        int entityLen = IntegerRleCompressor.Compress(buffers.EntityIds, buffers.CompressedEntityIds);
+        long minTimestamp = buffers.Timestamps[0];
+        long maxTimestamp = buffers.Timestamps[batchSize - 1];
+
+        // 4. Compress each column over the exact [0..batchSize) slice
+        int tsLen = TimestampCompressor.Compress(buffers.Timestamps.AsSpan(0, batchSize), buffers.CompressedTimestamps);
+        int cpuLen = GorillaCompressor.Compress(buffers.CpuUsages.AsSpan(0, batchSize), buffers.CompressedCpuUsages);
+        int memLen = GorillaCompressor.Compress(buffers.MemUsages.AsSpan(0, batchSize), buffers.CompressedMemUsages);
+        int entityLen = IntegerRleCompressor.Compress(buffers.EntityIds.AsSpan(0, batchSize), buffers.CompressedEntityIds);
 
         // 5. Calculate Column Offsets
-        long tsOffset = 64;
+        long tsOffset = HeaderSize;
         long cpuOffset = tsOffset + tsLen;
         long memOffset = cpuOffset + cpuLen;
         long entityOffset = memOffset + memLen;
 
-        // 6. Populate 64-byte Header
-        Span<byte> header = buffers.FileHeaderBuffer;
-        header.Clear(); // Ensure empty bytes for padding
+        // 6. Populate 64-byte-aligned v2 Header
+        Span<byte> header = buffers.FileHeaderBuffer.AsSpan(0, HeaderSize);
+        header.Clear();
 
-        // Magic bytes: 'GLCH' -> 0x48434C47
-        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(0, 4), 0x48434C47);
-        // Version: 1
-        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(4, 4), 1);
-        // Row count
+        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(0, 4), Magic);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(4, 4), FormatVersion);
         BinaryPrimitives.WriteInt32LittleEndian(header.Slice(8, 4), batchSize);
 
+        // Zone-map timestamp bounds
+        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(12, 8), minTimestamp);
+        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(20, 8), maxTimestamp);
+
         // Timestamps offset & length
-        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(12, 8), tsOffset);
-        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(20, 4), tsLen);
+        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(28, 8), tsOffset);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(36, 4), tsLen);
 
-        // CPU usages offset & length
-        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(24, 8), cpuOffset);
-        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(32, 4), cpuLen);
+        // CPU usages offset & length (slot 0)
+        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(40, 8), cpuOffset);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(48, 4), cpuLen);
 
-        // Mem usages offset & length
-        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(36, 8), memOffset);
-        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(44, 4), memLen);
+        // Mem usages offset & length (slot 1)
+        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(52, 8), memOffset);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(60, 4), memLen);
 
-        // Entity IDs offset & length
-        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(48, 8), entityOffset);
-        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(56, 4), entityLen);
+        // Entity IDs offset & length (slot 2)
+        BinaryPrimitives.WriteInt64LittleEndian(header.Slice(64, 8), entityOffset);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(72, 4), entityLen);
 
         // 7. Write to File
         Directory.CreateDirectory(outputDirectory);

@@ -4,19 +4,43 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
     <Authors>ian-cowley</Authors>
     <Description>Zero-allocation embedded time-series compression engine in C# for .NET 10.0</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Chrono</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>timeseries;database;compression;dotnet;csharp;simd;gorilla;rle;zero-allocation</PackageTags>
+    <PackageTags>timeseries;database;compression;dotnet;csharp;simd;gorilla;rle;zero-allocation;source-generator;aot</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="..\..\README.md" Pack="true" PackagePath="\"/>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Glacier.Chrono.Generator\Glacier.Chrono.Generator.csproj"
+                      ReferenceOutputAssembly="false"
+                      PrivateAssets="all" />
+  </ItemGroup>
+
+  <Target Name="_IncludeGeneratorInPackage" BeforeTargets="_GetPackageFiles">
+    <MSBuild Projects="..\Glacier.Chrono.Generator\Glacier.Chrono.Generator.csproj"
+             Targets="GetTargetPath"
+             Properties="Configuration=$(Configuration);TargetFramework=netstandard2.0">
+      <Output TaskParameter="TargetOutputs" ItemName="_GeneratorTargetOutputs" />
+    </MSBuild>
+    <ItemGroup>
+      <None Include="@(_GeneratorTargetOutputs)"
+            Pack="true"
+            PackagePath="analyzers/dotnet/cs"
+            Visible="false" />
+    </ItemGroup>
+  </Target>
 
 </Project>

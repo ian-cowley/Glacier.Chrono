@@ -1,6 +1,7 @@
 using System;
 using System.Buffers.Binary;
 using System.IO;
+using Glacier.Chrono.Query;
 using Glacier.Chrono.Storage;
 using Xunit;
 
@@ -32,12 +33,12 @@ public class AosToSoaAndCompactorTests : IDisposable
     }
 
     [Fact]
-    public void CompactBatch_TransposesAosToSoaAndWritesChunk()
+    public void CompactBatch_TransposesAosToSoaAndWritesV2ZoneMapHeader()
     {
         const int batchSize = 100;
         var ring = new HotRingBuffer<TelemetryRow>(128);
 
-        // Ingest un-ordered rows to verify sorting
+        // Ingest unordered rows to verify sorting and zone-map bounds
         for (int i = batchSize - 1; i >= 0; i--)
         {
             ring.Write(new TelemetryRow
@@ -57,7 +58,6 @@ public class AosToSoaAndCompactorTests : IDisposable
         Assert.Equal(batchSize, nextSeq);
         Assert.Equal(batchSize - 1, ring.ReadProgress);
 
-        // Verify sorted order in buffers
         for (int i = 0; i < batchSize; i++)
         {
             Assert.Equal(1000L + i, buffers.Timestamps[i]);
@@ -67,23 +67,83 @@ public class AosToSoaAndCompactorTests : IDisposable
         string chunkPath = Path.Combine(_testDir, "chunk_0.glacier");
         Assert.True(File.Exists(chunkPath));
 
-        // Verify 64-byte Header
         using var fs = File.OpenRead(chunkPath);
-        byte[] header = new byte[64];
+        byte[] header = new byte[Compactor.HeaderSize];
         fs.ReadExactly(header);
 
         uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
         uint version = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(4, 4));
         int rowCount = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));
+        long minTs = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(12, 8));
+        long maxTs = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(20, 8));
+        long tsOffset = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(28, 8));
+        int tsLen = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(36, 4));
 
-        Assert.Equal(0x48434C47u, magic); // 'GLCH'
-        Assert.Equal(1u, version);
+        Assert.Equal(Compactor.Magic, magic);
+        Assert.Equal(Compactor.FormatVersion, version);
         Assert.Equal(batchSize, rowCount);
-
-        long tsOffset = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(12, 8));
-        int tsLen = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(20, 4));
-        Assert.Equal(64L, tsOffset);
+        Assert.Equal(1000L, minTs);
+        Assert.Equal(1000L + batchSize - 1, maxTs);
+        Assert.Equal((long)Compactor.HeaderSize, tsOffset);
         Assert.True(tsLen > 0);
+    }
+
+    [Fact]
+    public void CompactBatch_PartialBatchSmallerThanBufferCapacity_CompactsExactSliceOnly()
+    {
+        const int bufferCapacity = 500;
+        const int partialBatchSize = 73;
+        var ring = new HotRingBuffer<TelemetryRow>(512);
+
+        double expectedCpuSum = 0.0;
+        for (int i = 0; i < partialBatchSize; i++)
+        {
+            float cpu = 40.0f + i * 0.5f;
+            expectedCpuSum += cpu;
+            ring.Write(new TelemetryRow
+            {
+                Timestamp = 5000L + i * 10L,
+                CpuUsage = cpu,
+                MemUsage = 80.0f,
+                EntityId = 1
+            });
+        }
+
+        // Allocate reusable buffers MUCH larger than partialBatchSize, pre-polluted with sentinel data
+        var compBuffers = new CompactorBuffers(bufferCapacity);
+        Array.Fill(compBuffers.Timestamps, 999_999_999L);
+        Array.Fill(compBuffers.CpuUsages, -9999.0f);
+        Array.Fill(compBuffers.EntityIds, 1);
+
+        long nextSeq = 0;
+        bool success = Compactor.CompactBatch(ring, ref nextSeq, partialBatchSize, _testDir, compBuffers);
+
+        Assert.True(success);
+        Assert.Equal(partialBatchSize, nextSeq);
+        Assert.Equal(partialBatchSize - 1, ring.ReadProgress);
+
+        string chunkPath = Path.Combine(_testDir, "chunk_0.glacier");
+        var zoneMap = QueryEngine.ReadChunkZoneMap(chunkPath);
+        Assert.Equal(partialBatchSize, zoneMap.RowCount);
+        Assert.Equal(5000L, zoneMap.MinTimestamp);
+        Assert.Equal(5000L + (partialBatchSize - 1) * 10L, zoneMap.MaxTimestamp);
+
+        var queryBuffers = new QueryBuffers(bufferCapacity);
+        double actualAvg = QueryEngine.GetAverageCpuUsageForEntity(chunkPath, 1, queryBuffers);
+        Assert.Equal(expectedCpuSum / partialBatchSize, actualAvg, precision: 5);
+    }
+
+    [Fact]
+    public void CompactBatch_BatchSizeExceedsBuffers_ThrowsArgumentOutOfRangeException()
+    {
+        var ring = new HotRingBuffer<TelemetryRow>(64);
+        var buffers = new CompactorBuffers(32);
+        long nextSeq = 0;
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            Compactor.CompactBatch(ring, ref nextSeq, 33, _testDir, buffers));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            Compactor.CompactBatch(ring, ref nextSeq, 0, _testDir, buffers));
     }
 
     [Fact]

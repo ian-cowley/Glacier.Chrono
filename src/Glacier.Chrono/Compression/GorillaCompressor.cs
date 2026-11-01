@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Numerics;
 
 namespace Glacier.Chrono.Compression;
@@ -21,6 +22,7 @@ public static class GorillaCompressor
 
         if (values.Length == 1)
         {
+            writer.Flush();
             return writer.BytesWritten;
         }
 
@@ -104,6 +106,7 @@ public static class GorillaCompressor
         uint prevVal = firstVal;
         int prevLz = 0;
         int prevTz = 0;
+        bool hasPrevWindow = false;
 
         for (int i = 1; i < destination.Length; i++)
         {
@@ -118,6 +121,11 @@ public static class GorillaCompressor
                 uint currVal;
                 if (caseBit == 0)
                 {
+                    if (!hasPrevWindow)
+                    {
+                        throw new InvalidDataException("Corrupt Gorilla stream: referenced previous window before initialization.");
+                    }
+
                     // Case A: Use previous leading/trailing zero counts
                     int prevLen = 32 - prevLz - prevTz;
                     uint bits = (uint)reader.ReadBits(prevLen);
@@ -129,13 +137,19 @@ public static class GorillaCompressor
                     // Case B: Read new leading zeros and length
                     int lz = (int)reader.ReadBits(5);
                     int len = (int)reader.ReadBits(6);
+                    if (len == 0 || lz + len > 32)
+                    {
+                        throw new InvalidDataException("Corrupt Gorilla stream.");
+                    }
+
                     uint bits = (uint)reader.ReadBits(len);
                     int tz = 32 - lz - len;
                     uint xor = bits << tz;
                     currVal = prevVal ^ xor;
-                    
+
                     prevLz = lz;
                     prevTz = tz;
+                    hasPrevWindow = true;
                 }
 
                 destination[i] = BitConverter.UInt32BitsToSingle(currVal);

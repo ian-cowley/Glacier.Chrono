@@ -74,7 +74,7 @@ class Program
         long endBytes = GC.GetAllocatedBytesForCurrentThread();
         long ingestAllocated = endBytes - startBytes;
 
-        Console.WriteLine($"Ingest completed in {stopwatch.Elapsed.TotalMilliseconds:F2} ms");
+        Console.WriteLine($"Ingest completed in {stopwatch.Elapsed.TotalMilliseconds:F2} ms (Calling-thread allocations: {ingestAllocated} bytes)");
 
         // 2. Pivot & Compaction via Generator-emitted Compactor
         Console.WriteLine("\n[2/5] Compacting custom schema and flushing to disk via generated compactor...");

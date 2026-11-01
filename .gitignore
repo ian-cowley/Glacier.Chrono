@@ -2,6 +2,18 @@
 [Bb]in/
 [Oo]bj/
 [Oo]ut/
+packages/
+TestResults/
+*.nupkg
+*.snupkg
+
+## Secrets & local configuration (Zero Secrets Policy)
+appsettings*.json
+!appsettings.template.json
+*.env*
+*.pfx
+*.key
+*.pem
 
 ## IDE and user settings
 .vs/

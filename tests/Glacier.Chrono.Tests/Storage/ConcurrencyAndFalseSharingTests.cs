@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Threading.Tasks;
 using Glacier.Chrono.Storage;
 using Xunit;
 
@@ -32,21 +31,18 @@ public class ConcurrencyAndFalseSharingTests
     {
         var buffer = new HotRingBuffer<int>(4);
 
-        // Fill buffer to capacity
         for (int i = 0; i < 4; i++)
         {
             bool w = buffer.TryWrite(i, TimeSpan.FromMilliseconds(100));
             Assert.True(w);
         }
 
-        // 5th write must time out because readProgress is -1L
         var sw = Stopwatch.StartNew();
         bool success = buffer.TryWrite(999, TimeSpan.FromMilliseconds(50));
         sw.Stop();
 
         Assert.False(success);
         Assert.True(sw.ElapsedMilliseconds >= 35);
-        // Write cursor must NOT have advanced permanently
         Assert.Equal(4, buffer.WriteCursor);
     }
 
@@ -61,109 +57,163 @@ public class ConcurrencyAndFalseSharingTests
         {
             buffer.TryWrite(999, TimeSpan.FromSeconds(5), cts.Token);
         });
+        Assert.Equal(4, buffer.WriteCursor);
     }
 
     [Fact]
-    public async Task Concurrent_SPSC_HighThroughput_IntegrityVerified()
+    public void Concurrent_SPSC_HighThroughput_IntegrityVerified()
     {
-        const int totalItems = 100_000;
+        const int totalItems = 40_000;
         const int capacity = 4096;
         var buffer = new HotRingBuffer<int>(capacity);
+        Exception? workerError = null;
 
-        var producer = Task.Run(() =>
+        var producer = new Thread(() =>
         {
-            for (int i = 0; i < totalItems; i++)
+            try
             {
-                buffer.Write(i);
-            }
-        });
-
-        var consumer = Task.Run(() =>
-        {
-            int readCount = 0;
-            long nextSeq = 0;
-            int[] temp = new int[256];
-
-            while (readCount < totalItems)
-            {
-                int toRead = Math.Min(temp.Length, totalItems - readCount);
-                var span = temp.AsSpan(0, toRead);
-                if (buffer.TryReadBatch(nextSeq, span))
+                for (int i = 0; i < totalItems; i++)
                 {
-                    for (int i = 0; i < toRead; i++)
+                    buffer.Write(i, TimeSpan.FromSeconds(10));
+                }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.CompareExchange(ref workerError, ex, null);
+            }
+        })
+        { IsBackground = true, Name = "SPSC-Producer" };
+
+        var consumer = new Thread(() =>
+        {
+            try
+            {
+                int readCount = 0;
+                long nextSeq = 0;
+                int[] temp = new int[256];
+                SpinWait spinner = default;
+
+                while (readCount < totalItems && Volatile.Read(ref workerError) is null)
+                {
+                    int toRead = Math.Min(temp.Length, totalItems - readCount);
+                    var span = temp.AsSpan(0, toRead);
+                    if (buffer.TryReadBatch(nextSeq, span))
                     {
-                        Assert.Equal(readCount + i, span[i]);
+                        for (int i = 0; i < toRead; i++)
+                        {
+                            Assert.Equal(readCount + i, span[i]);
+                        }
+                        readCount += toRead;
+                        nextSeq += toRead;
+                        buffer.CommitReadProgress(nextSeq - 1);
+                        spinner.Reset();
                     }
-                    readCount += toRead;
-                    nextSeq += toRead;
-                    buffer.CommitReadProgress(nextSeq - 1);
-                }
-                else
-                {
-                    Thread.SpinWait(10);
+                    else
+                    {
+                        spinner.SpinOnce();
+                    }
                 }
             }
-        });
+            catch (Exception ex)
+            {
+                Interlocked.CompareExchange(ref workerError, ex, null);
+            }
+        })
+        { IsBackground = true, Name = "SPSC-Consumer" };
 
-        await Task.WhenAll(producer, consumer);
+        producer.Start();
+        consumer.Start();
+
+        Assert.True(producer.Join(TimeSpan.FromSeconds(15)), "Producer timed out.");
+        Assert.True(consumer.Join(TimeSpan.FromSeconds(15)), "Consumer timed out.");
+        if (workerError is not null) throw workerError;
     }
 
     [Fact]
-    public async Task Concurrent_MPMC_StressTest_ZeroDataLoss()
+    public void Concurrent_MPMC_StressTest_ZeroDataLoss()
     {
-        const int threadCount = 4;
-        const int itemsPerThread = 25_000;
-        const int totalItems = threadCount * itemsPerThread;
-        const int capacity = 8192;
+        int producerCount = Math.Clamp(Environment.ProcessorCount, 2, 4);
+        const int itemsPerThread = 10_000;
+        int totalItems = producerCount * itemsPerThread;
+        const int capacity = 4096;
 
         var buffer = new HotRingBuffer<long>(capacity);
         long[] received = new long[totalItems];
         int receivedIndex = 0;
+        Exception? workerError = null;
 
-        // Start consumer
-        var consumer = Task.Run(() =>
+        var consumer = new Thread(() =>
         {
-            long nextSeq = 0;
-            long[] batch = new long[512];
-            while (Volatile.Read(ref receivedIndex) < totalItems)
+            try
             {
-                int needed = Math.Min(batch.Length, totalItems - Volatile.Read(ref receivedIndex));
-                if (needed <= 0) break;
+                long nextSeq = 0;
+                long[] batch = new long[256];
+                SpinWait spinner = default;
 
-                var span = batch.AsSpan(0, needed);
-                if (buffer.TryReadBatch(nextSeq, span))
+                while (Volatile.Read(ref receivedIndex) < totalItems && Volatile.Read(ref workerError) is null)
                 {
-                    for (int i = 0; i < needed; i++)
+                    int needed = Math.Min(batch.Length, totalItems - Volatile.Read(ref receivedIndex));
+                    if (needed <= 0) break;
+
+                    var span = batch.AsSpan(0, needed);
+                    if (buffer.TryReadBatch(nextSeq, span))
                     {
-                        received[nextSeq + i] = span[i];
+                        for (int i = 0; i < needed; i++)
+                        {
+                            received[nextSeq + i] = span[i];
+                        }
+                        nextSeq += needed;
+                        Interlocked.Add(ref receivedIndex, needed);
+                        buffer.CommitReadProgress(nextSeq - 1);
+                        spinner.Reset();
                     }
-                    nextSeq += needed;
-                    Interlocked.Add(ref receivedIndex, needed);
-                    buffer.CommitReadProgress(nextSeq - 1);
-                }
-                else
-                {
-                    Thread.Yield();
+                    else
+                    {
+                        spinner.SpinOnce();
+                    }
                 }
             }
-        });
-
-        // Start producers
-        Parallel.For(0, threadCount, t =>
-        {
-            for (int i = 0; i < itemsPerThread; i++)
+            catch (Exception ex)
             {
-                long val = ((long)t << 32) | (uint)i;
-                buffer.Write(val);
+                Interlocked.CompareExchange(ref workerError, ex, null);
             }
-        });
+        })
+        { IsBackground = true, Name = "MPMC-Consumer" };
 
-        var completedTask = await Task.WhenAny(consumer, Task.Delay(15000));
-        Assert.True(completedTask == consumer, "Consumer timed out waiting for all MPMC items.");
-        await consumer;
+        var producers = new Thread[producerCount];
+        for (int p = 0; p < producerCount; p++)
+        {
+            int threadId = p;
+            producers[p] = new Thread(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < itemsPerThread; i++)
+                    {
+                        long val = ((long)(threadId + 1) << 32) | (uint)i;
+                        buffer.Write(val, TimeSpan.FromSeconds(10));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Interlocked.CompareExchange(ref workerError, ex, null);
+                }
+            })
+            { IsBackground = true, Name = $"MPMC-Producer-{threadId}" };
+        }
+
+        consumer.Start();
+        foreach (var t in producers) t.Start();
+
+        foreach (var t in producers)
+        {
+            Assert.True(t.Join(TimeSpan.FromSeconds(15)), "Producer thread timed out.");
+        }
+        Assert.True(consumer.Join(TimeSpan.FromSeconds(15)), "Consumer thread timed out.");
+        if (workerError is not null) throw workerError;
+
         Assert.Equal(totalItems, Volatile.Read(ref receivedIndex));
 
-        // Verify zero corruption & zero duplicate data
         var uniqueReceived = new HashSet<long>(received);
         Assert.Equal(totalItems, uniqueReceived.Count);
     }

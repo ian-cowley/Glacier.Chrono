@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using Glacier.Chrono.Compression;
 using Xunit;
 
@@ -13,16 +14,16 @@ public class GorillaCompressorTests
         int bytes = GorillaCompressor.Compress(ReadOnlySpan<float>.Empty, dest);
         Assert.Equal(0, bytes);
 
-        float[] decomp = new float[10];
         int floats = GorillaCompressor.Decompress(dest, Span<float>.Empty);
         Assert.Equal(0, floats);
     }
 
     [Fact]
-    public void RoundTrip_SingleFloat()
+    public void RoundTrip_SingleFloat_IntoDirtyBuffer()
     {
         float[] src = [3.14159f];
         byte[] buffer = new byte[16];
+        Array.Fill(buffer, (byte)0xFF);
         int bytesWritten = GorillaCompressor.Compress(src, buffer);
         Assert.Equal(4, bytesWritten);
 
@@ -99,6 +100,50 @@ public class GorillaCompressorTests
         {
             Assert.Equal(src[i], dest[i]);
         }
+    }
+
+    [Fact]
+    public void Decompress_CorruptCaseAZeroWindowOnSecondValue_ThrowsInvalidDataException()
+    {
+        byte[] corrupt = new byte[16];
+        var writer = new BitWriter(corrupt);
+        writer.WriteBits(BitConverter.SingleToUInt32Bits(1.0f), 32);
+        writer.WriteBit(1); // controlBit = 1 (changed)
+        writer.WriteBit(0); // caseBit = 0 (invalid: no previous Case B window exists!)
+        writer.Flush();
+
+        float[] dest = new float[2];
+        Assert.Throws<InvalidDataException>(() => GorillaCompressor.Decompress(corrupt, dest));
+    }
+
+    [Fact]
+    public void Decompress_CorruptZeroLengthOrOverflowWindow_ThrowsInvalidDataException()
+    {
+        // Case 1: len == 0
+        byte[] zeroLenStream = new byte[16];
+        var w1 = new BitWriter(zeroLenStream);
+        w1.WriteBits(BitConverter.SingleToUInt32Bits(1.0f), 32);
+        w1.WriteBit(1);        // controlBit = 1
+        w1.WriteBit(1);        // caseBit = 1 (new window)
+        w1.WriteBits(5, 5);    // lz = 5
+        w1.WriteBits(0, 6);    // len = 0 (invalid!)
+        w1.Flush();
+
+        float[] dest = new float[2];
+        Assert.Throws<InvalidDataException>(() => GorillaCompressor.Decompress(zeroLenStream, dest));
+
+        // Case 2: lz + len > 32
+        byte[] overflowWindowStream = new byte[16];
+        var w2 = new BitWriter(overflowWindowStream);
+        w2.WriteBits(BitConverter.SingleToUInt32Bits(1.0f), 32);
+        w2.WriteBit(1);        // controlBit = 1
+        w2.WriteBit(1);        // caseBit = 1 (new window)
+        w2.WriteBits(20, 5);   // lz = 20
+        w2.WriteBits(20, 6);   // len = 20 -> lz + len = 40 > 32 (invalid!)
+        w2.WriteBits(0xFFFFF, 20);
+        w2.Flush();
+
+        Assert.Throws<InvalidDataException>(() => GorillaCompressor.Decompress(overflowWindowStream, dest));
     }
 
     [Fact]

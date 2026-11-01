@@ -51,13 +51,12 @@ public class TimestampCompressorTests
         long baseTs = 1_700_000_000_000L;
         for (int i = 0; i < n; i++)
         {
-            src[i] = baseTs + (i * 1000L); // Exact 1-second interval
+            src[i] = baseTs + (i * 1000L);
         }
 
         byte[] buffer = new byte[n * 9 + 64];
         int bytesWritten = TimestampCompressor.Compress(src, buffer);
 
-        // First timestamp (8B) + first delta (8B) + (9998 * 1 bit = 1250B) = ~1266 bytes
         Assert.True(bytesWritten < 1300, $"Expected DoD=0 compression < 1300B but got {bytesWritten}B");
 
         long[] dest = new long[n];
@@ -77,7 +76,6 @@ public class TimestampCompressorTests
     [InlineData(64)]
     public void RoundTrip_7BitDoDBoundaries(long targetDoD)
     {
-        // T0, T1 (delta 1000), T2 (delta = 1000 + targetDoD)
         long[] src = [10000L, 11000L, 11000L + 1000L + targetDoD];
         byte[] buf = new byte[64];
         int bytes = TimestampCompressor.Compress(src, buf);
@@ -142,7 +140,7 @@ public class TimestampCompressorTests
     [Fact]
     public void RoundTrip_NegativeDeltas_ClockRewindOrOutOfOrder()
     {
-        long[] src = [1000L, 900L, 800L, 700L]; // Descending timestamps
+        long[] src = [1000L, 900L, 800L, 700L];
         byte[] buf = new byte[64];
         int bytes = TimestampCompressor.Compress(src, buf);
 
@@ -156,6 +154,20 @@ public class TimestampCompressorTests
     }
 
     [Fact]
+    public void RoundTrip_ExtremeInt64Boundaries_UncheckedWrapAroundExact()
+    {
+        long[] src = [long.MinValue, long.MaxValue, 0L, long.MinValue + 1, long.MaxValue - 1, -1L];
+        byte[] buf = new byte[128];
+        int bytes = TimestampCompressor.Compress(src, buf);
+
+        long[] dest = new long[src.Length];
+        int count = TimestampCompressor.Decompress(buf.AsSpan(0, bytes), dest);
+
+        Assert.Equal(src.Length, count);
+        Assert.Equal(src, dest);
+    }
+
+    [Fact]
     public void TimestampCompressAndDecompress_ZeroHeapAllocations()
     {
         long[] src = new long[1000];
@@ -164,7 +176,6 @@ public class TimestampCompressorTests
         byte[] buf = new byte[src.Length * 9 + 64];
         long[] dest = new long[src.Length];
 
-        // Warmup
         TimestampCompressor.Compress(src, buf);
         TimestampCompressor.Decompress(buf, dest);
 
@@ -176,5 +187,6 @@ public class TimestampCompressorTests
 
         long endBytes = GC.GetAllocatedBytesForCurrentThread();
         Assert.Equal(0, endBytes - startBytes);
+        Assert.Equal(src.Length, count);
     }
 }

@@ -14,10 +14,8 @@ public static class TimestampCompressor
 
         var writer = new BitWriter(destination);
 
-        // Store first timestamp in full (64 bits, split into two 32-bit writes to prevent accumulator overflow)
-        ulong t0 = (ulong)values[0];
-        writer.WriteBits(t0 >> 32, 32);
-        writer.WriteBits(t0 & 0xFFFFFFFF, 32);
+        // Store first timestamp in full (64 bits)
+        writer.WriteBits((ulong)values[0], 64);
 
         if (values.Length == 1)
         {
@@ -25,11 +23,9 @@ public static class TimestampCompressor
             return writer.BytesWritten;
         }
 
-        // Store first delta in full (64 bits, split into two 32-bit writes)
-        long firstDelta = values[1] - values[0];
-        ulong d0 = (ulong)firstDelta;
-        writer.WriteBits(d0 >> 32, 32);
-        writer.WriteBits(d0 & 0xFFFFFFFF, 32);
+        // Store first delta in full (64 bits, explicit unchecked two's-complement delta)
+        long firstDelta = unchecked(values[1] - values[0]);
+        writer.WriteBits((ulong)firstDelta, 64);
 
         long prevDelta = firstDelta;
         long prevVal = values[1];
@@ -37,8 +33,13 @@ public static class TimestampCompressor
         for (int i = 2; i < values.Length; i++)
         {
             long currVal = values[i];
-            long currDelta = currVal - prevVal;
-            long dod = currDelta - prevDelta;
+            long currDelta;
+            long dod;
+            unchecked
+            {
+                currDelta = currVal - prevVal;
+                dod = currDelta - prevDelta;
+            }
 
             if (dod == 0)
             {
@@ -49,7 +50,7 @@ public static class TimestampCompressor
                 // Write '10' (2 bits), then write dod + 63 (7 bits)
                 writer.WriteBit(1);
                 writer.WriteBit(0);
-                writer.WriteBits((ulong)(dod + 63), 7);
+                writer.WriteBits((ulong)unchecked(dod + 63), 7);
             }
             else if (dod >= -255 && dod <= 256)
             {
@@ -57,7 +58,7 @@ public static class TimestampCompressor
                 writer.WriteBit(1);
                 writer.WriteBit(1);
                 writer.WriteBit(0);
-                writer.WriteBits((ulong)(dod + 255), 9);
+                writer.WriteBits((ulong)unchecked(dod + 255), 9);
             }
             else if (dod >= -2047 && dod <= 2048)
             {
@@ -66,19 +67,16 @@ public static class TimestampCompressor
                 writer.WriteBit(1);
                 writer.WriteBit(1);
                 writer.WriteBit(0);
-                writer.WriteBits((ulong)(dod + 2047), 12);
+                writer.WriteBits((ulong)unchecked(dod + 2047), 12);
             }
             else
             {
-                // Write '1111' (4 bits), then write raw dod (64 bits, split into two 32-bit writes)
+                // Write '1111' (4 bits), then write raw dod (64 bits)
                 writer.WriteBit(1);
                 writer.WriteBit(1);
                 writer.WriteBit(1);
                 writer.WriteBit(1);
-                
-                ulong dodVal = (ulong)dod;
-                writer.WriteBits(dodVal >> 32, 32);
-                writer.WriteBits(dodVal & 0xFFFFFFFF, 32);
+                writer.WriteBits((ulong)dod, 64);
             }
 
             prevDelta = currDelta;
@@ -99,8 +97,8 @@ public static class TimestampCompressor
 
         var reader = new BitReader(source);
 
-        // Read first timestamp (64 bits, read as two 32-bit parts)
-        long firstVal = ((long)reader.ReadBits(32) << 32) | (long)reader.ReadBits(32);
+        // Read first timestamp (64 bits)
+        long firstVal = unchecked((long)reader.ReadBits(64));
         destination[0] = firstVal;
 
         if (destination.Length == 1)
@@ -108,9 +106,9 @@ public static class TimestampCompressor
             return 1;
         }
 
-        // Read first delta (64 bits, read as two 32-bit parts)
-        long firstDelta = ((long)reader.ReadBits(32) << 32) | (long)reader.ReadBits(32);
-        destination[1] = firstVal + firstDelta;
+        // Read first delta (64 bits)
+        long firstDelta = unchecked((long)reader.ReadBits(64));
+        destination[1] = unchecked(firstVal + firstDelta);
 
         long prevDelta = firstDelta;
         long prevVal = destination[1];
@@ -129,7 +127,7 @@ public static class TimestampCompressor
                 if (bit1 == 0)
                 {
                     // '10' -> 7 bits
-                    dod = (long)reader.ReadBits(7) - 63;
+                    dod = unchecked((long)reader.ReadBits(7) - 63);
                 }
                 else
                 {
@@ -137,7 +135,7 @@ public static class TimestampCompressor
                     if (bit2 == 0)
                     {
                         // '110' -> 9 bits
-                        dod = (long)reader.ReadBits(9) - 255;
+                        dod = unchecked((long)reader.ReadBits(9) - 255);
                     }
                     else
                     {
@@ -145,19 +143,24 @@ public static class TimestampCompressor
                         if (bit3 == 0)
                         {
                             // '1110' -> 12 bits
-                            dod = (long)reader.ReadBits(12) - 2047;
+                            dod = unchecked((long)reader.ReadBits(12) - 2047);
                         }
                         else
                         {
-                            // '1111' -> 64 bits (read as two 32-bit parts)
-                            dod = ((long)reader.ReadBits(32) << 32) | (long)reader.ReadBits(32);
+                            // '1111' -> 64 bits
+                            dod = unchecked((long)reader.ReadBits(64));
                         }
                     }
                 }
             }
 
-            long currDelta = prevDelta + dod;
-            long currVal = prevVal + currDelta;
+            long currDelta;
+            long currVal;
+            unchecked
+            {
+                currDelta = prevDelta + dod;
+                currVal = prevVal + currDelta;
+            }
             destination[i] = currVal;
 
             prevDelta = currDelta;
