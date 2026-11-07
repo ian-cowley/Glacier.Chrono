@@ -54,13 +54,13 @@ public static class Compactor
     public const uint Magic = 0x48434C47;
 
     /// <summary>
-    /// Current .glacier chunk header format version (includes zone-map [MinTimestamp, MaxTimestamp] bounds).
+    /// Current .glacier chunk header format version (includes zone-map bounds for timestamps and metric columns).
     /// </summary>
-    public const uint FormatVersion = 2;
+    public const uint FormatVersion = 3;
 
     /// <summary>
     /// 64-byte aligned header size for <see cref="TelemetryRow"/> chunks:
-    /// Magic(4) + Version(4) + RowCount(4) + MinTs(8) + MaxTs(8) + Ts(12) + Cpu(12) + Mem(12) + Entity(12) = 76 -> 128 bytes.
+    /// Magic(4) + Version(4) + RowCount(4) + MinTs(8) + MaxTs(8) + Ts(12) + Cpu(12) + Mem(12) + Entity(12) + MetricZoneMaps(40) = 116 -> 128 bytes.
     /// </summary>
     public const int HeaderSize = (40 + 3 * 12 + 63) & ~63;
 
@@ -94,13 +94,32 @@ public static class Compactor
         // 2. Sort the batch ascending by Timestamp (zero-allocation using struct IComparable)
         Array.Sort(buffers.RowBuffer, 0, batchSize);
 
-        // 3. Matrix Transpose (AoS to SoA)
+        // 3. Matrix Transpose (AoS to SoA) and Metric Zone-Map Bound Tracking
+        float minCpu = float.MaxValue;
+        float maxCpu = float.MinValue;
+        float minMem = float.MaxValue;
+        float maxMem = float.MinValue;
+        int minEntity = int.MaxValue;
+        int maxEntity = int.MinValue;
+
         for (int i = 0; i < batchSize; i++)
         {
-            buffers.Timestamps[i] = buffers.RowBuffer[i].Timestamp;
-            buffers.CpuUsages[i] = buffers.RowBuffer[i].CpuUsage;
-            buffers.MemUsages[i] = buffers.RowBuffer[i].MemUsage;
-            buffers.EntityIds[i] = buffers.RowBuffer[i].EntityId;
+            long ts = buffers.RowBuffer[i].Timestamp;
+            float cpu = buffers.RowBuffer[i].CpuUsage;
+            float mem = buffers.RowBuffer[i].MemUsage;
+            int ent = buffers.RowBuffer[i].EntityId;
+
+            buffers.Timestamps[i] = ts;
+            buffers.CpuUsages[i] = cpu;
+            buffers.MemUsages[i] = mem;
+            buffers.EntityIds[i] = ent;
+
+            if (cpu < minCpu) minCpu = cpu;
+            if (cpu > maxCpu) maxCpu = cpu;
+            if (mem < minMem) minMem = mem;
+            if (mem > maxMem) maxMem = mem;
+            if (ent < minEntity) minEntity = ent;
+            if (ent > maxEntity) maxEntity = ent;
         }
 
         long minTimestamp = buffers.Timestamps[0];
@@ -118,7 +137,7 @@ public static class Compactor
         long memOffset = cpuOffset + cpuLen;
         long entityOffset = memOffset + memLen;
 
-        // 6. Populate 64-byte-aligned v2 Header
+        // 6. Populate 64-byte-aligned v3 Header
         Span<byte> header = buffers.FileHeaderBuffer.AsSpan(0, HeaderSize);
         header.Clear();
 
@@ -126,25 +145,34 @@ public static class Compactor
         BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(4, 4), FormatVersion);
         BinaryPrimitives.WriteInt32LittleEndian(header.Slice(8, 4), batchSize);
 
-        // Zone-map timestamp bounds
+        // Zone-map timestamp bounds (12..28)
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(12, 8), minTimestamp);
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(20, 8), maxTimestamp);
 
-        // Timestamps offset & length
+        // Timestamps offset & length (28..40)
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(28, 8), tsOffset);
         BinaryPrimitives.WriteInt32LittleEndian(header.Slice(36, 4), tsLen);
 
-        // CPU usages offset & length (slot 0)
+        // CPU usages offset & length (40..52)
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(40, 8), cpuOffset);
         BinaryPrimitives.WriteInt32LittleEndian(header.Slice(48, 4), cpuLen);
 
-        // Mem usages offset & length (slot 1)
+        // Mem usages offset & length (52..64)
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(52, 8), memOffset);
         BinaryPrimitives.WriteInt32LittleEndian(header.Slice(60, 4), memLen);
 
-        // Entity IDs offset & length (slot 2)
+        // Entity IDs offset & length (64..76)
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(64, 8), entityOffset);
         BinaryPrimitives.WriteInt32LittleEndian(header.Slice(72, 4), entityLen);
+
+        // Zone-map metric bounds for FormatVersion 3 (76..116)
+        BinaryPrimitives.WriteDoubleLittleEndian(header.Slice(76, 8), minCpu);
+        BinaryPrimitives.WriteDoubleLittleEndian(header.Slice(84, 8), maxCpu);
+        BinaryPrimitives.WriteDoubleLittleEndian(header.Slice(92, 8), minMem);
+        BinaryPrimitives.WriteDoubleLittleEndian(header.Slice(100, 8), maxMem);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(108, 4), minEntity);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(112, 4), maxEntity);
+
 
         // 7. Write to File
         Directory.CreateDirectory(outputDirectory);
@@ -166,4 +194,38 @@ public static class Compactor
         nextSequenceToRead += batchSize;
         return true;
     }
+
+    /// <summary>
+    /// Reads metric zone-map bounds from a FormatVersion 3 .glacier chunk file header.
+    /// </summary>
+    public static bool TryReadMetricZoneMap(
+        string chunkFilePath,
+        out double minCpu,
+        out double maxCpu,
+        out double minMem,
+        out double maxMem,
+        out int minEntity,
+        out int maxEntity)
+    {
+        minCpu = maxCpu = minMem = maxMem = 0.0;
+        minEntity = maxEntity = 0;
+
+        using var fs = new FileStream(chunkFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        Span<byte> header = stackalloc byte[HeaderSize];
+        int bytesRead = fs.Read(header);
+        if (bytesRead < HeaderSize) return false;
+
+        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0, 4));
+        uint version = BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(4, 4));
+        if (magic != Magic || version < 3) return false;
+
+        minCpu = BinaryPrimitives.ReadDoubleLittleEndian(header.Slice(76, 8));
+        maxCpu = BinaryPrimitives.ReadDoubleLittleEndian(header.Slice(84, 8));
+        minMem = BinaryPrimitives.ReadDoubleLittleEndian(header.Slice(92, 8));
+        maxMem = BinaryPrimitives.ReadDoubleLittleEndian(header.Slice(100, 8));
+        minEntity = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(108, 4));
+        maxEntity = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(112, 4));
+        return true;
+    }
 }
+

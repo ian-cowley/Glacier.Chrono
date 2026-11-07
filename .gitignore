@@ -42,3 +42,8 @@ temp/
 tmp/
 glacier_data/
 benchmark_data/
+
+bin/
+obj/
+*.tmp
+!.env.example

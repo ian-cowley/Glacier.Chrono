@@ -301,7 +301,7 @@ public static class QueryEngine
         }
 
         uint version = BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(4, 4));
-        if (version != Compactor.FormatVersion || bytesRead < HeaderSize)
+        if ((version != 2 && version != 3) || bytesRead < HeaderSize)
         {
             throw new InvalidDataException($"Unsupported or truncated .glacier header version: {version}.");
         }
@@ -399,7 +399,15 @@ public static class QueryEngine
         }
 
         Span<float> metricSpan = metricArray.AsSpan(0, rowCount);
-        GorillaCompressor.Decompress(compressedMetricBuffer.AsSpan(0, metricLen), metricSpan);
+        if (metricLen >= AlpCompressor.HeaderSize &&
+            BinaryPrimitives.ReadUInt32LittleEndian(compressedMetricBuffer.AsSpan(0, 4)) == AlpCompressor.Magic)
+        {
+            AlpCompressor.DecompressFloat(compressedMetricBuffer.AsSpan(0, metricLen), metricSpan);
+        }
+        else
+        {
+            GorillaCompressor.Decompress(compressedMetricBuffer.AsSpan(0, metricLen), metricSpan);
+        }
         ReadOnlySpan<float> metricSlice = metricSpan.Slice(startIndex, endIndex - startIndex);
 
         if (!hasCategoryFilter)
